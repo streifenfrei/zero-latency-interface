@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+*.so
+
+# Virtual environment
+.venv/
+venv/
+
+# Outputs
+outputs/
+plan_outputs/
+logs/
+
+# WandB
+wandb/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SLURM
+slurm-*.out

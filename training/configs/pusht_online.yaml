@@ -1,0 +1,53 @@
+# On-device online data provider for PushT: trained-policy rollout with a
+# linear noise ladder.
+#
+# Rolls out a trained PushT policy across ``num_envs`` parallel ManiSkill
+# environments. Each env gets a corruption probability on a linear ramp from
+# ``noise_p_min`` (env 0 → pure policy) to ``noise_p_max`` (last env → pure
+# noise). Every step, with probability p_k that env's policy action is
+# replaced by a corruption action (random direction and/or idle). The result
+# is a dataset at graded distances from the policy distribution.
+#
+# Requires a CUDA GPU with a working Vulkan driver (SAPIEN renderer).
+# ``num_workers`` MUST be 0 — the ManiSkill environment lives on-device and
+# is not fork-safe.
+#
+# Prerequisite: a trained policy checkpoint at the path below (produced by
+# ``zero_latency_interface/scripts/train_ppo.py`` or
+# ``zero_latency_interface/slurm/rl/pusht_deploy.sbatch``).
+
+name: pusht_online
+args: []
+kwargs:
+  with_velocity: true
+  with_target: true
+
+dataset:
+  _target_: "training.pusht_online.load_pusht_online_train_val"
+  data_path: "online (ManiSkill PushT + noise ladder)"  # log-only; data generated on-device
+
+  # --- policy ----------------------------------------------------------------
+  policy_checkpoint: ${oc.env:ZERO_LATENCY_ROOT}/checkpoints/policy.pt
+  zero_latency_root: ${oc.env:ZERO_LATENCY_ROOT}
+
+  # --- env / rollout ---------------------------------------------------------
+  num_envs: 64               # parallel envs = noise-ladder rungs
+  img_size: ${img_size}      # render resolution (dino_wm default: 224)
+  max_episode_steps: 100     # per-episode horizon
+
+  # --- noise ladder ----------------------------------------------------------
+  noise_kind: random         # "random" | "idle" | "mixed"
+  noise_p_min: 0.0           # corruption prob for env 0 (pure policy)
+  noise_p_max: 1.0           # corruption prob for last env (pure noise)
+
+  # --- data routing ----------------------------------------------------------
+  val_ratio: 0.1             # fraction of chunks routed to validation
+  samples_per_epoch: 50000   # samples yielded per epoch by the iterable dataset
+
+  # --- device / sim ----------------------------------------------------------
+  device: cuda
+  sim_backend: physx_cuda    # required for batched on-device rendering
+  seed: ${training.seed}
+
+decoder_path: null
+num_workers: 0               # CRITICAL: env is not fork-safe
