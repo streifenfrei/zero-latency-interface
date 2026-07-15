@@ -13,6 +13,13 @@ are supported:
     Simulated network delay on the GT frame stream.  The WM compensates
     by predicting ahead from the last arrived (delayed) GT frame to the
     current timestep.  Display: [ WM prediction | delayed GT ].
+
+Input
+    Keyboard (WASD) is always available as a fallback.  When a gamepad is
+    connected via :class:`deployment.gamepad.GamepadInput`, the left analog
+    stick drives the PushT agent — stick direction controls push direction,
+    and the stick maps to a fixed-speed move (like the RL policy).  LB/RB
+    act as precision/boost modifiers.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ _push_t_module = importlib.util.module_from_spec(_push_t_spec)
 _push_t_spec.loader.exec_module(_push_t_module)
 PushTEnv = _push_t_module.PushTEnv
 from deployment.delay import ConstantDelay, DelayModel, NoDelay
+from deployment.gamepad import GamepadInput
 from deployment.wm_adapter import DinoWMPushtAdapter
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -94,6 +102,10 @@ class PushTInterface:
         Max display dimension in pixels.
     fps:
         Target display frame rate.
+    gamepad:
+        Optional :class:`GamepadInput` instance.  When provided (and connected),
+        the left analog stick drives the PushT agent.  Keyboard WASD remains
+        available as a fallback.
     """
 
     def __init__(
@@ -104,10 +116,12 @@ class PushTInterface:
         delay_steps: int = 10,
         display_size: int = 840,
         fps: int = 20,
+        gamepad: Optional[GamepadInput] = None,
     ) -> None:
         self._mode = mode
         self._display_size = display_size
         self._fps = fps
+        self._gamepad = gamepad
 
         # --- environment ------------------------------------------------------
         self._env = PushTEnv(
@@ -173,17 +187,34 @@ class PushTInterface:
         cv2.resizeWindow(WINDOW_NAME, self._display_size,
                          int(self._display_size * 0.6))
 
+        # Sync gamepad button state so we don't get spurious edge triggers.
+        if self._gamepad is not None and self._gamepad.connected:
+            self._gamepad.reset_button_state()
+
         clock = deque(maxlen=30)
 
         while self._running:
             t0 = time.perf_counter()
 
+            # --- pump gamepad events (if connected) --------------------------
+            if self._gamepad is not None and self._gamepad.connected:
+                self._gamepad.pump()
+
             # --- input --------------------------------------------------------
             key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
+            quit_now = (key == 27)  # ESC
+
+            # Read gamepad + keyboard; gamepad takes priority for movement.
+            gp_dx, gp_dy, gp_buttons = (0.0, 0.0, {})
+            if self._gamepad is not None and self._gamepad.connected:
+                gp_dx, gp_dy, gp_buttons = self._gamepad.read()
+                quit_now = quit_now or gp_buttons.get("quit", False)
+
+            if quit_now:
                 self._running = False
                 break
-            action = self._get_action(key)
+
+            action = self._get_action(key, gp_dx, gp_dy, gp_buttons)
 
             # --- env step -----------------------------------------------------
             obs, reward, done, info = self._env.step(action)
@@ -245,10 +276,14 @@ class PushTInterface:
             clock.append(dt)
             self._timestep += 1
 
-            # Reset if episode ended.
-            if done:
+            # Reset if episode ended or gamepad button pressed.
+            reset_requested = gp_buttons.get("reset", False) if gp_buttons else False
+            next_ep = gp_buttons.get("next_episode", False) if gp_buttons else False
+            if done or reset_requested or next_ep:
                 self._do_reset()
 
+        if self._gamepad is not None and self._gamepad.connected:
+            self._gamepad.close()
         cv2.destroyAllWindows()
 
     # -- internals -------------------------------------------------------------
@@ -283,8 +318,25 @@ class PushTInterface:
         print(f"[IF] WM grounded with {needed} context frames "
               f"(raw timestep={self._timestep})")
 
-    def _get_action(self, key: int) -> np.ndarray:
-        """Read keyboard input → (dx, dy) action in pixel space [0, 512]."""
+    def _get_action(
+        self,
+        key: int,
+        gp_dx: float = 0.0,
+        gp_dy: float = 0.0,
+        gp_buttons: dict | None = None,
+    ) -> np.ndarray:
+        """Read input → (dx, dy) action in pixel space [0, 512].
+
+        Gamepad input takes priority for movement; keyboard WASD is the
+        fallback.  When the gamepad stick is idle (near zero) and a WASD
+        key is pressed, keyboard control is used.
+        """
+        del gp_buttons  # button-actions handled directly in run()
+        # Gamepad takes priority when the stick is actively deflected.
+        gp_active = (abs(gp_dx) > 0.5 or abs(gp_dy) > 0.5)
+        if gp_active:
+            return np.array([gp_dx, gp_dy], dtype=np.float32)
+        # Keyboard fallback.
         if key in KEY_ACTIONS:
             return np.array(KEY_ACTIONS[key], dtype=np.float32)
         return np.array([0, 0], dtype=np.float32)
@@ -364,7 +416,11 @@ class PushTInterface:
         y_base = main.shape[0] + 15
         _put_text(canvas, label, (4, y_base), (100, 255, 100))
         _put_text(canvas, f"t={self._timestep}", (4, y_base + 18), (200, 200, 200))
-        _put_text(canvas, "WASD=move  ESC=quit  R=reset",
-                  (4, y_base + 36), (150, 150, 150))
+
+        if self._gamepad is not None and self._gamepad.connected:
+            hint = "L-stick=move  LB=precise  RB=boost  A=reset  B=quit  ESC=quit"
+        else:
+            hint = "WASD=move  ESC=quit  R=reset"
+        _put_text(canvas, hint, (4, y_base + 36), (150, 150, 150))
 
         return canvas

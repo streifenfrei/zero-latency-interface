@@ -1,17 +1,23 @@
 """Zero-latency interface for DINO-WM PushT world model.
 
-Provides pluggable delay simulation and a WM adapter for interactive,
-frame-by-frame prediction compensating for network latency.
+Provides pluggable delay simulation, a WM adapter for interactive
+frame-by-frame prediction, and gamepad (PS4/Xbox) input support.
 
-Note: PushTInterface requires pymunk + pygame + shapely (for the PushT env).
-Install with:  pip install pymunk pygame shapely scikit-image
+Note: PushTInterface + DinoWMPushtAdapter require torch + pymunk + pygame +
+shapely.  Install in a venv with those deps before using the full interface.
 """
 
 from deployment.delay import ConstantDelay, DelayModel, NoDelay
-from deployment.wm_adapter import DinoWMPushtAdapter
+from deployment.gamepad import GamepadInput, GamepadMapping, apply_deadzone
 
-# PushTInterface is imported lazily — it depends on pymunk/pygame/shapely
-# which may not be installed on headless machines.
+# DinoWMPushtAdapter is imported lazily — it depends on torch + dino_wm.
+# PushTInterface is imported lazily — it depends on pymunk/pygame/shapely.
+
+
+def get_adapter(*args, **kwargs):
+    """Lazy factory for DinoWMPushtAdapter (avoids eager torch import)."""
+    from deployment.wm_adapter import DinoWMPushtAdapter
+    return DinoWMPushtAdapter(*args, **kwargs)
 
 
 def get_interface(*args, **kwargs):
@@ -23,7 +29,10 @@ def get_interface(*args, **kwargs):
 __all__ = [
     "ConstantDelay",
     "DelayModel",
-    "DinoWMPushtAdapter",
+    "GamepadInput",
+    "GamepadMapping",
     "NoDelay",
+    "apply_deadzone",
+    "get_adapter",
     "get_interface",
 ]

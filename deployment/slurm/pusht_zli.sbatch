@@ -44,12 +44,20 @@ run() { CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
 
 mkdir -p logs
 
+# Gamepad (set GAMEPAD=1 to enable).
+GAMEPAD_FLAG=""
+if [[ "${GAMEPAD:-0}" == "1" ]]; then
+    GAMEPAD_FLAG="--gamepad"
+    echo "gamepad: enabled"
+fi
+
 if [ "$MODE" = "wm_only" ]; then
     run deployment/run_wm_only.py \
         --ckpt "$CKPT_DIR" \
         --ckpt_suffix "$CKPT_SUFFIX" \
         --display_size "$DISPLAY_SIZE" \
-        --fps "$FPS"
+        --fps "$FPS" \
+        $GAMEPAD_FLAG
 elif [ "$MODE" = "passthrough" ]; then
     run -c "
 import sys
@@ -63,7 +71,8 @@ else
         --ckpt_suffix "$CKPT_SUFFIX" \
         --delay_steps "$DELAY_STEPS" \
         --display_size "$DISPLAY_SIZE" \
-        --fps "$FPS"
+        --fps "$FPS" \
+        $GAMEPAD_FLAG
 fi
 
 echo "DONE"

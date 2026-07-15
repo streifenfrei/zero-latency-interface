@@ -57,23 +57,37 @@ sbatch training/slurm/pusht_train.sbatch
 Requires a trained model checkpoint and a display with X11.
 
 ```bash
-# ZLI mode (simulated network delay, WM compensates):
+# Keyboard only:
 python deployment/run_zli.py --ckpt outputs/.../checkpoints --delay_steps 10
 
+# With PS4/Xbox gamepad (left stick drives the agent):
+python deployment/run_zli.py --ckpt outputs/.../checkpoints --gamepad
+
 # WM-only mode (open-loop autoregressive prediction):
-python deployment/run_wm_only.py --ckpt outputs/.../checkpoints
+python deployment/run_wm_only.py --ckpt outputs/.../checkpoints --gamepad
 
 # SLURM (launches on GPU node with X11 forwarding):
-sbatch deployment/slurm/pusht_zli.sbatch
+GAMEPAD=1 sbatch deployment/slurm/pusht_zli.sbatch
 ```
 
 ### Controls
 
+**Keyboard:**
 | Key | Action |
 |-----|--------|
 | WASD | Move PushT agent |
 | Q/E/Z/C | Diagonal movement |
 | ESC | Quit |
+
+**Gamepad (PS4 / Xbox):**
+| Control | Action |
+|---------|--------|
+| Left stick | Move PushT agent (direction = push direction) |
+| LB (L1) | Precision mode (slower, 0.3× speed) |
+| RB (R1) | Boost mode (faster, 2× speed) |
+| A (cross) | Reset episode |
+| B (circle) | Quit |
+| Y (triangle) | Next episode |
 
 ### Modes
 
