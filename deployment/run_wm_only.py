@@ -1,20 +1,24 @@
 #!/usr/bin/env python
-"""World-model-only PushT interaction.
+"""World-model-only PushT interaction (ManiSkill 3D).
 
 Runs the DINO-WM autoregressively from an initial context — user actions
 drive the world model forward with no ground-truth feedback.  The PushT
 environment runs silently alongside for comparison (shown as a small inset).
+
+The environment is ManiSkill PushT (3D PandaStick robot).  Requires:
+  - A GPU with a working Vulkan driver (SAPIEN / physx_cuda).
+  - The sibling ``zero_latency_interface`` repo for the env wrapper.
 
 Input: Keyboard WASD always works.  When a PS4/Xbox gamepad is connected, the
 left analog stick drives the agent.
 
 Usage:
     # Keyboard only:
-    python deployment/run_wm_only.py \
+    python deployment/run_wm_only.py \\
         --ckpt outputs/.../checkpoints
 
     # With gamepad:
-    python deployment/run_wm_only.py \
+    python deployment/run_wm_only.py \\
         --ckpt outputs/.../checkpoints --gamepad
 """
 
@@ -70,6 +74,31 @@ def main() -> None:
                     help="Swap stick x and y axes.")
     gp.add_argument("--gamepad-debug", action="store_true",
                     help="Print live gamepad axis/button values to stdout.")
+
+    # ── ManiSkill environment options ──────────────────────────────────────
+    ms = parser.add_argument_group("ManiSkill environment")
+    ms.add_argument("--env-id", default="PushT-XYExplore-v1",
+                    help="Gymnasium env id (default: PushT-XYExplore-v1).")
+    ms.add_argument("--zero-latency-root", default=None,
+                    help="Path to zero_latency_interface repo.")
+    ms.add_argument("--policy-checkpoint", default=None,
+                    help="Path to a trained PPO policy checkpoint (.pt).")
+    ms.add_argument("--control-mode", default="pd_ee_delta_pose",
+                    choices=["pd_ee_delta_pose", "pd_ee_pose"],
+                    help="EE controller (default: pd_ee_delta_pose).")
+    ms.add_argument("--action-scale", type=float, default=0.1,
+                    help="Maniskill action_scale (default: 0.1).")
+    ms.add_argument("--step-size", type=float, default=0.02,
+                    help="Metres per step at full deflection (default: 0.02).")
+    ms.add_argument("--push-height", type=float, default=0.015,
+                    help="Fixed stick-tip height (m) (default: 0.015).")
+    ms.add_argument("--sim-backend", default="physx_cuda",
+                    choices=["physx_cuda", "physx_cpu"],
+                    help="ManiSkill simulation backend (default: physx_cuda).")
+    ms.add_argument("--max-episode-steps", type=int, default=100_000,
+                    help="Per-episode horizon (default: 100000).")
+    ms.add_argument("--no-velocity", action="store_true",
+                    help="Exclude EE velocity from proprio (default: include).")
     args = parser.parse_args()
 
     # ── gamepad setup ──────────────────────────────────────────────────────
@@ -88,6 +117,21 @@ def main() -> None:
         )
         gamepad.setup()
 
+    # ── build env kwargs ───────────────────────────────────────────────────
+    env_kwargs = dict(
+        env_id=args.env_id,
+        zero_latency_root=args.zero_latency_root,
+        policy_checkpoint=args.policy_checkpoint,
+        control_mode=args.control_mode,
+        action_scale=args.action_scale,
+        step_size=args.step_size,
+        max_input=args.gamepad_speed if args.gamepad else 60.0,
+        push_height=args.push_height,
+        sim_backend=args.sim_backend,
+        max_episode_steps=args.max_episode_steps,
+        with_velocity=not args.no_velocity,
+    )
+
     iface = get_interface(
         mode="wm_only",
         wm_ckpt_dir=args.ckpt,
@@ -95,6 +139,7 @@ def main() -> None:
         display_size=args.display_size,
         fps=args.fps,
         gamepad=gamepad,
+        env_kwargs=env_kwargs,
     )
     iface.run()
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the DINO-WM PushT zero-latency interface on a GPU node.
+# Launch the DINO-WM PushT zero-latency interface on a GPU node (ManiSkill 3D).
 #
 # This is an *interactive* GUI application — run it with:
 #   sbatch deployment/slurm/pusht_zli.sbatch
@@ -9,9 +9,14 @@
 #   # The OpenCV window will appear on your local machine.
 #
 # Overridable via env:
-#   MODE          — "zli" (default), "wm_only", or "passthrough"
-#   CKPT_DIR      — path to checkpoints/ directory
-#   DELAY_STEPS   — simulated delay in raw timesteps (ZLI mode, default: 10)
+#   MODE                — "zli" (default), "wm_only", or "passthrough"
+#   CKPT_DIR            — path to checkpoints/ directory
+#   DELAY_STEPS         — simulated delay in raw timesteps (ZLI mode, default: 10)
+#   ZERO_LATENCY_ROOT   — path to zero_latency_interface repo
+#   POLICY_CHECKPOINT   — path to PPO policy checkpoint (args only)
+#   CONTROL_MODE        — "pd_ee_delta_pose" (default) or "pd_ee_pose"
+#   STEP_SIZE           — metres/step at full deflection (default: 0.02)
+#   SIM_BACKEND         — "physx_cuda" (default) or "physx_cpu"
 
 #SBATCH --job-name=dino_pusht_zli
 #SBATCH --output=logs/pusht_zli_%j.out
@@ -34,8 +39,18 @@ DELAY_STEPS="${DELAY_STEPS:-10}"
 DISPLAY_SIZE="${DISPLAY_SIZE:-840}"
 FPS="${FPS:-20}"
 
+# ManiSkill environment config.
+ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT:-$ZLI_PATH/../zero_latency_interface}"
+POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-$ZERO_LATENCY_ROOT/checkpoints/policy.pt}"
+CONTROL_MODE="${CONTROL_MODE:-pd_ee_delta_pose}"
+STEP_SIZE="${STEP_SIZE:-0.02}"
+ACTION_SCALE="${ACTION_SCALE:-0.1}"
+SIM_BACKEND="${SIM_BACKEND:-physx_cuda}"
+
 echo "host=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 echo "mode=$MODE  ckpt=$CKPT_DIR$CKPT_SUFFIX  delay=$DELAY_STEPS steps"
+echo "mani: control=$CONTROL_MODE  step=$STEP_SIZE  sim=$SIM_BACKEND"
+echo "zl_root=$ZERO_LATENCY_ROOT  policy_ckpt=$POLICY_CHECKPOINT"
 
 # Strip distributed env vars.
 run() { CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
@@ -51,19 +66,41 @@ if [[ "${GAMEPAD:-0}" == "1" ]]; then
     echo "gamepad: enabled"
 fi
 
+# Shared ManiSkill args.
+MANI_ARGS=(
+    --zero-latency-root "$ZERO_LATENCY_ROOT"
+    --control-mode "$CONTROL_MODE"
+    --step-size "$STEP_SIZE"
+    --action-scale "$ACTION_SCALE"
+    --sim-backend "$SIM_BACKEND"
+)
+if [[ -n "${POLICY_CHECKPOINT}" && -f "${POLICY_CHECKPOINT}" ]]; then
+    MANI_ARGS+=(--policy-checkpoint "$POLICY_CHECKPOINT")
+fi
+
 if [ "$MODE" = "wm_only" ]; then
     run deployment/run_wm_only.py \
         --ckpt "$CKPT_DIR" \
         --ckpt_suffix "$CKPT_SUFFIX" \
         --display_size "$DISPLAY_SIZE" \
         --fps "$FPS" \
-        $GAMEPAD_FLAG
+        $GAMEPAD_FLAG \
+        "${MANI_ARGS[@]}"
 elif [ "$MODE" = "passthrough" ]; then
     run -c "
 import sys
 sys.path.insert(0, '.')
 from deployment import get_interface
-get_interface(mode='passthrough', display_size=$DISPLAY_SIZE, fps=$FPS).run()
+env_kw = dict(
+    zero_latency_root='$ZERO_LATENCY_ROOT',
+    control_mode='$CONTROL_MODE',
+    step_size=$STEP_SIZE,
+    action_scale=$ACTION_SCALE,
+    sim_backend='$SIM_BACKEND',
+)
+if '$POLICY_CHECKPOINT' and __import__('os').path.isfile('$POLICY_CHECKPOINT'):
+    env_kw['policy_checkpoint'] = '$POLICY_CHECKPOINT'
+get_interface(mode='passthrough', display_size=$DISPLAY_SIZE, fps=$FPS, env_kwargs=env_kw).run()
 "
 else
     run deployment/run_zli.py \
@@ -72,7 +109,8 @@ else
         --delay_steps "$DELAY_STEPS" \
         --display_size "$DISPLAY_SIZE" \
         --fps "$FPS" \
-        $GAMEPAD_FLAG
+        $GAMEPAD_FLAG \
+        "${MANI_ARGS[@]}"
 fi
 
 echo "DONE"

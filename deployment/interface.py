@@ -1,8 +1,8 @@
 """Interactive PushT zero-latency interface.
 
-Wires together the PushT environment, the DINO-WM world model adapter,
-a configurable delay simulator, and an OpenCV-based display.  Two modes
-are supported:
+Wires together the ManiSkill 3D PushT environment, the DINO-WM world model
+adapter, a configurable delay simulator, and an OpenCV-based display.  Two
+modes are supported:
 
 ``wm_only``
     The world model runs open-loop from an initial context.  User actions
@@ -24,7 +24,6 @@ Input
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import time
 from collections import deque
@@ -33,15 +32,6 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# Import PushTEnv directly — bypass env/__init__.py which triggers MuJoCo/d4rl.
-_push_t_path = os.path.join(
-    os.path.dirname(__file__), "..", "dino_wm", "env", "pusht", "pusht_env.py"
-)
-_push_t_spec = importlib.util.spec_from_file_location(
-    "pusht_env", _push_t_path)
-_push_t_module = importlib.util.module_from_spec(_push_t_spec)
-_push_t_spec.loader.exec_module(_push_t_module)
-PushTEnv = _push_t_module.PushTEnv
 from deployment.delay import ConstantDelay, DelayModel, NoDelay
 from deployment.gamepad import GamepadInput
 from deployment.wm_adapter import DinoWMPushtAdapter
@@ -52,7 +42,8 @@ GT_INSET_SCALE = 0.3        # GT inset size relative to main display
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 TICK_RATE = 20              # target loop Hz
 
-# Keyboard mappings.
+# Keyboard mappings — produce pixel-space (dx, dy), normalised by max_input
+# inside the ManiSkill adapter.  60 = full-speed step.
 KEY_ACTIONS: dict[int, tuple[float, float]] = {
     ord("w"): (0, 60),      # up
     ord("s"): (0, -60),     # down
@@ -84,7 +75,7 @@ def _resize_to_fit(img: np.ndarray, max_w: int, max_h: int) -> np.ndarray:
 # ── main interface class ─────────────────────────────────────────────────────
 
 class PushTInterface:
-    """Interactive PushT zero-latency interface.
+    """Interactive PushT zero-latency interface (ManiSkill 3D backend).
 
     Parameters
     ----------
@@ -106,6 +97,8 @@ class PushTInterface:
         Optional :class:`GamepadInput` instance.  When provided (and connected),
         the left analog stick drives the PushT agent.  Keyboard WASD remains
         available as a fallback.
+    env_kwargs:
+        Forwarded to :class:`deployment.mani_skill_env.ManiSkillPushTEnv`.
     """
 
     def __init__(
@@ -117,18 +110,18 @@ class PushTInterface:
         display_size: int = 840,
         fps: int = 20,
         gamepad: Optional[GamepadInput] = None,
+        env_kwargs: dict | None = None,
     ) -> None:
         self._mode = mode
         self._display_size = display_size
         self._fps = fps
         self._gamepad = gamepad
 
-        # --- environment ------------------------------------------------------
-        self._env = PushTEnv(
-            with_velocity=True,
-            with_target=True,
-            render_size=224,
-        )
+        # --- environment (ManiSkill 3D) --------------------------------------
+        from deployment.mani_skill_env import ManiSkillPushTEnv
+
+        _env_kw = dict(env_kwargs) if env_kwargs else {}
+        self._env = ManiSkillPushTEnv(**_env_kw)
         self._env.seed(0)
 
         # --- world model ------------------------------------------------------
@@ -235,7 +228,11 @@ class PushTInterface:
                     self._gt_aligned_proprios = self._gt_aligned_proprios[-cap:]
 
             # --- action tracking ----------------------------------------------
-            raw_action = np.array(action, dtype=np.float32) / 100.0
+            # Store the effective action (after fix_magnitude + scaled_delta)
+            # so the WM sees actions in the same format as training data.
+            eff_action = info.get("effective_action",
+                                   np.array(action, dtype=np.float32) / 100.0)
+            raw_action = np.asarray(eff_action, dtype=np.float32)
             self._action_history.append(raw_action)
 
             # --- delay pipeline -----------------------------------------------
