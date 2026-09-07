@@ -47,6 +47,25 @@ class ManiSkillPushTEnv:
     max_input:
         The keyboard/gamepad value that maps to full deflection.  Default 60
         (matches the existing WASD magnitude and gamepad default speed).
+    fixed_magnitude:
+        ``None`` (default) follows the policy checkpoint's setting if one is
+        given, else ``False``.  With the unit-circle projection on, every
+        non-idle move is ``action_scale`` m/step (how the training policy
+        acted — and how the WM's action encoder saw the data); note this
+        makes the env move faster than the original gamepad teleop when
+        ``action_scale`` > ``step_size``.  ``False`` preserves the teleop
+        command magnitude so full deflection moves exactly ``step_size``
+        m/step (``gamepad_teleop_pusht.py --speed`` style) — with the
+        checkpoint's ``action_scale`` cancelling out of the conversion, the
+        effective actions are ``(dx/max_input) * step_size/0.1`` regardless.
+    level_ee:
+        ``None`` (default) follows the policy checkpoint's setting if one is
+        given, else ``False``.  When on (delta mode), each step commands a
+        rotation correction back to the upright orientation captured at
+        reset, capped at ``level_ee_rot_bound`` rad/step — this is why the
+        training data (and the WM rollout) always shows a vertical stick.
+        Off, delta mode sends drot=0 and contact torques tilt the stick
+        permanently.
     push_height:
         Fixed stick-tip height (m) above the table.  Default 0.015.
     render_size:
@@ -58,6 +77,11 @@ class ManiSkillPushTEnv:
         ManiSkill simulation backend.  Default ``"physx_cuda"``.
     with_velocity:
         Include EE velocity in proprio.  Default ``True``.
+    goal_tolerance:
+        Required overlap fraction (0..1) between the pushed T-block and the
+        goal T for task success — ManiSkill's ``intersection_thresh``.
+        LOWER = more tolerant of position/orientation error.  Default 0.90
+        (the stock PushT threshold).
     seed:
         Random seed.
     """
@@ -72,11 +96,14 @@ class ManiSkillPushTEnv:
         action_scale: float = 0.1,
         step_size: float = 0.02,
         max_input: float = 60.0,
+        fixed_magnitude: Optional[bool] = None,
+        level_ee: Optional[bool] = None,
         push_height: float = 0.015,
         render_size: int = 224,
         max_episode_steps: int = 100_000,
         sim_backend: str = "physx_cuda",
         with_velocity: bool = True,
+        goal_tolerance: float = 0.90,
         seed: int = 0,
     ) -> None:
         # Resolve and register the sibling repo.
@@ -101,6 +128,13 @@ class ManiSkillPushTEnv:
                 policy_checkpoint, map_location="cpu", weights_only=False
             )
             targs = ckpt.get("args", {})
+        elif policy_checkpoint is not None:
+            print(
+                f"[MS-Env] WARNING: policy checkpoint not found at "
+                f"{policy_checkpoint!r} — falling back to CLI defaults for the "
+                f"wrapper config (action_scale, level_ee, ... may differ from "
+                f"the training run)."
+            )
 
         _ctrl = targs.get("control_mode", control_mode)
         _ascale = targs.get("action_scale", action_scale)
@@ -110,8 +144,15 @@ class ManiSkillPushTEnv:
         _fix_push_height = targs.get("fix_push_height", True)
         _fix_orientation = targs.get("fix_orientation", True)
         _no_ee_vel = targs.get("no_ee_vel", False)
-        _fixed_magnitude = targs.get("fixed_magnitude", True)
-        _level_ee = targs.get("level_ee", False)
+        # Default: follow the checkpoint when given; otherwise teleop-style
+        # (False) — the configuration where the WM rollout empirically tracks
+        # GT and the speed matches gamepad_teleop_pusht.py.  Explicitly
+        # passing fixed_magnitude (True/False) overrides both.
+        _fixed_magnitude = (
+            targs.get("fixed_magnitude", False)
+            if fixed_magnitude is None else fixed_magnitude
+        )
+        _level_ee = targs.get("level_ee", False) if level_ee is None else level_ee
         _level_ee_gain = targs.get("level_ee_gain", 1.0)
         _level_ee_rot_bound = targs.get("level_ee_rot_bound", 0.1)
         _xy_absolute_target = targs.get("xy_absolute_target", False)
@@ -140,6 +181,10 @@ class ManiSkillPushTEnv:
             sim_backend=sim_backend,
             max_episode_steps=max_episode_steps,
         )
+        # Success tolerance: PushTEnv.evaluate() reads intersection_thresh as
+        # an instance attribute at call time, so a runtime override changes
+        # the goal condition without touching the task class.
+        base.unwrapped.intersection_thresh = float(goal_tolerance)
         self._wrapper = PushTXYWrapper(
             base,
             action_scale=_ascale,

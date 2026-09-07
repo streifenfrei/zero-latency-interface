@@ -57,7 +57,7 @@ def main() -> None:
         "--ckpt_suffix", default="_latest",
         help="checkpoint suffix")
     parser.add_argument(
-        "--delay_steps", type=int, default=10,
+        "--delay-steps", type=int, default=10,
         help="simulated network delay in raw timesteps (default: 10)")
     parser.add_argument(
         "--display_size", type=int, default=840,
@@ -112,6 +112,21 @@ def main() -> None:
     ms.add_argument("--step-size", type=float, default=0.02,
                     help="Metres per step at full keyboard/gamepad deflection "
                          "(default: 0.02 — matches gamepad_teleop_pusht.py).")
+    ms.add_argument("--fixed-magnitude", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Unit-circle projection on commands (training-policy "
+                         "style: every non-idle move is action_scale m/step). "
+                         "Default: follow the policy checkpoint's setting when "
+                         "--policy-checkpoint is given, else off.  With the "
+                         "projection off, full deflection moves step_size "
+                         "m/step (teleop style, --speed in the other repo).")
+    ms.add_argument("--level-ee", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Actively level the end-effector back to vertical "
+                         "each step (delta mode), as in the training data. "
+                         "Default: follow the policy checkpoint's setting when "
+                         "--policy-checkpoint is given, else off (drot=0 — the "
+                         "stick stays tilted after collisions).")
     ms.add_argument("--push-height", type=float, default=0.015,
                     help="Fixed stick-tip height (m) above the table "
                          "(default: 0.015).")
@@ -149,6 +164,8 @@ def main() -> None:
         action_scale=args.action_scale,
         step_size=args.step_size,
         max_input=args.gamepad_speed if args.gamepad else 60.0,
+        fixed_magnitude=args.fixed_magnitude,
+        level_ee=args.level_ee,
         push_height=args.push_height,
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,

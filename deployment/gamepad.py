@@ -219,11 +219,11 @@ class GamepadInput:
         raw_x = apply_deadzone(js.get_axis(m.LX), self._deadzone)  # +1 = right
         raw_y = apply_deadzone(js.get_axis(m.LY), self._deadzone)  # +1 = down
 
-        # Map stick to world: stick down (+LY) → world +y (up on screen),
-        # stick right (+LX) → world +x (right on screen).
-        # This follows the same convention as the keyboard WASD mapping
-        # where 'w' (up) = (0, +60) and 'd' (right) = (+60, 0).
-        dx, dy = raw_x, -raw_y  # negate LY so stick up → +dy
+        # Default intuitive mapping for PushT's camera (eye=+x, looking toward
+        # -x), matching gamepad_teleop_pusht.py:
+        #   stick down (+LY)  → world +x (toward camera, bottom of screen)
+        #   stick right (+LX) → world +y (right of screen)
+        dx, dy = raw_y, raw_x
 
         if self._swap_xy:
             dx, dy = dy, dx

@@ -25,6 +25,7 @@ Input
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import deque
 from typing import Optional
@@ -43,16 +44,18 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 TICK_RATE = 20              # target loop Hz
 
 # Keyboard mappings — produce pixel-space (dx, dy), normalised by max_input
-# inside the ManiSkill adapter.  60 = full-speed step.
+# inside the ManiSkill adapter.  60 = full-speed step.  Directions are
+# on-screen, mapped to world axes for PushT's camera (eye=+x, looking toward
+# -x): screen up = world -x, right = +y (same as gamepad_teleop_pusht.py).
 KEY_ACTIONS: dict[int, tuple[float, float]] = {
-    ord("w"): (0, 60),      # up
-    ord("s"): (0, -60),     # down
-    ord("a"): (-60, 0),     # left
-    ord("d"): (60, 0),      # right
-    ord("q"): (-60, 60),    # up-left
-    ord("e"): (60, 60),     # up-right
-    ord("z"): (-60, -60),   # down-left
-    ord("c"): (60, -60),    # down-right
+    ord("w"): (-60, 0),     # up (away from camera)
+    ord("s"): (60, 0),      # down (toward camera)
+    ord("a"): (0, -60),     # left
+    ord("d"): (0, 60),      # right
+    ord("q"): (-60, -60),   # up-left
+    ord("e"): (-60, 60),    # up-right
+    ord("z"): (60, -60),    # down-left
+    ord("c"): (60, 60),     # down-right
 }
 
 
@@ -70,6 +73,84 @@ def _resize_to_fit(img: np.ndarray, max_w: int, max_h: int) -> np.ndarray:
         return cv2.resize(img, (int(w * scale), int(h * scale)),
                           interpolation=cv2.INTER_NEAREST)
     return img
+
+
+def zli_tick(
+    wm: DinoWMPushtAdapter,
+    delay_received: tuple | None,
+    action_history: list,
+    get_timestep,
+    raw_action: np.ndarray,
+    gt_frame: np.ndarray,
+    grounding_thread: Optional[threading.Thread],
+    last_grounded_ts: int,
+) -> tuple[np.ndarray, Optional[np.ndarray], Optional[threading.Thread], int]:
+    """One tick of delay+WM display update (the ``zli`` mode's core logic).
+
+    Factored out of :meth:`PushTInterface.run` so it can be reused by other
+    drivers (e.g. a study UI) without duplicating the async-grounding launch
+    rule and ``get_timestep``-closure pattern.
+
+    Parameters
+    ----------
+    wm:
+        Already-grounded adapter.
+    delay_received:
+        The ``(frame, proprio, gt_ts)`` tuple from ``delay.receive(...)``,
+        or ``None`` if nothing arrived this tick.
+    action_history:
+        The caller's growing raw-action list (indexed by absolute raw
+        timestep — see ``_collect_context``'s invariant).
+    get_timestep:
+        Callable returning the current absolute raw timestep; passed through
+        to the async worker so it can chase the advancing present.
+    raw_action:
+        This tick's action, fed to ``wm.predict()``.
+    gt_frame:
+        Current live GT frame — the fallback display before the WM is
+        grounded.
+    grounding_thread, last_grounded_ts:
+        The caller's async-grounding bookkeeping from the previous tick.
+
+    Returns
+    -------
+    (display_frame, delayed_frame, grounding_thread, last_grounded_ts)
+        ``delayed_frame`` is ``None`` unless ``delay_received`` was not
+        ``None`` this tick (caller should keep its own "last delayed frame"
+        only when this isn't ``None``, matching the pre-extraction
+        behaviour).
+    """
+    # ALWAYS advance the WM one raw step per tick (single-step
+    # autoregression).  While an async grounding runs this advances the
+    # previous chain, keeping the display responsive; on publish it jumps
+    # to the grounded rollout.
+    if wm.is_initialised:
+        display_frame = wm.predict(raw_action)
+    else:
+        display_frame = gt_frame
+
+    delayed_frame = None
+    if delay_received is not None:
+        delayed_frame, delayed_proprio, gt_ts = delay_received
+        # Track the delayed stream's frameskip-aligned frames so the next
+        # grounding's context keeps the training stride.
+        wm.update_ground_truth(delayed_frame, delayed_proprio, gt_ts)
+        # Launch rule: only when no worker is running AND the frame is
+        # newer than the last grounding's frame.  No cancellation — the
+        # worker runs to completion; the next newer frame launches the
+        # next grounding.
+        if (grounding_thread is None or not grounding_thread.is_alive()) \
+                and gt_ts > last_grounded_ts:
+            last_grounded_ts = gt_ts
+            grounding_thread = threading.Thread(
+                target=wm.ground_and_predict_async,
+                args=(delayed_frame, delayed_proprio, gt_ts,
+                      action_history, get_timestep),
+                daemon=True, name="wm-grounding",
+            )
+            grounding_thread.start()
+
+    return display_frame, delayed_frame, grounding_thread, last_grounded_ts
 
 
 # ── main interface class ─────────────────────────────────────────────────────
@@ -117,20 +198,25 @@ class PushTInterface:
         self._fps = fps
         self._gamepad = gamepad
 
-        # --- environment (ManiSkill 3D) --------------------------------------
-        from deployment.mani_skill_env import ManiSkillPushTEnv
-
         _env_kw = dict(env_kwargs) if env_kwargs else {}
-        self._env = ManiSkillPushTEnv(**_env_kw)
-        self._env.seed(0)
 
         # --- world model ------------------------------------------------------
+        # Created first so the env's render resolution can match the WM's
+        # training image size (e.g. 448 for the high-res checkpoint).
         self._wm: DinoWMPushtAdapter | None = None
         if mode in ("wm_only", "zli"):
             self._wm = DinoWMPushtAdapter(
                 ckpt_dir=wm_ckpt_dir,
                 ckpt_suffix=wm_ckpt_suffix,
             )
+
+        # --- environment (ManiSkill 3D) --------------------------------------
+        from deployment.mani_skill_env import ManiSkillPushTEnv
+
+        if "render_size" not in _env_kw and self._wm is not None:
+            _env_kw["render_size"] = self._wm.img_size
+        self._env = ManiSkillPushTEnv(**_env_kw)
+        self._env.seed(0)
 
         # --- delay simulator --------------------------------------------------
         if mode == "zli":
@@ -154,11 +240,18 @@ class PushTInterface:
         self._delayed_frame: np.ndarray | None = None
         self._running: bool = False
 
+        # Async grounding (zli): worker thread + the gt_ts of the last
+        # LAUNCHED grounding (main-thread-only).
+        self._grounding_thread: Optional[threading.Thread] = None
+        self._last_grounded_ts: int = -1
+
     # -- public API ------------------------------------------------------------
 
     def run(self) -> None:
         """Start the interactive loop. Blocks until ESC is pressed."""
         self._running = True
+        self._grounding_thread = None
+        self._last_grounded_ts = -1
 
         # Reset environment.
         obs, state = self._env.reset()
@@ -236,28 +329,31 @@ class PushTInterface:
             self._action_history.append(raw_action)
 
             # --- delay pipeline -----------------------------------------------
-            self._delay.submit(gt_frame, self._timestep)
+            self._delay.submit(gt_frame, gt_proprio, self._timestep)
             received = self._delay.receive(self._timestep)
 
             # --- world model update -------------------------------------------
             if self._mode == "passthrough":
                 self._wm_frame = gt_frame
             elif self._wm is not None:
-                if received is not None:
-                    # A delayed GT frame arrived — ground & predict ahead.
-                    delayed_frame, gt_ts = received
-                    self._delayed_frame = delayed_frame
-                    actions_since = self._action_history[
-                        gt_ts + 1 : self._timestep + 1
-                    ]
-                    if actions_since:
-                        self._wm_frame = self._wm.ground_and_predict(
-                            delayed_frame,
-                            self._obs["proprio"],  # current proprio as approximation
-                            actions_since,
-                        )
+                if self._mode == "wm_only":
+                    # Open-loop: the WM runs purely autoregressively from its
+                    # initial context.  GT frames are never fed back into the
+                    # WM (they only appear in the inset for comparison), so
+                    # every step just advances the model one raw timestep.
+                    if self._wm.is_initialised:
+                        self._wm_frame = self._wm.predict(raw_action)
                     else:
-                        self._wm_frame = delayed_frame
+                        self._wm_frame = gt_frame
+                elif self._mode == "zli":
+                    (self._wm_frame, new_delayed, self._grounding_thread,
+                     self._last_grounded_ts) = zli_tick(
+                        self._wm, received, self._action_history,
+                        self._get_timestep, raw_action, gt_frame,
+                        self._grounding_thread, self._last_grounded_ts,
+                    )
+                    if new_delayed is not None:
+                        self._delayed_frame = new_delayed
                 elif self._wm.is_initialised:
                     # No new GT — advance WM by one step.
                     self._wm_frame = self._wm.predict(raw_action)
@@ -273,12 +369,19 @@ class PushTInterface:
             clock.append(dt)
             self._timestep += 1
 
+            # Pace the loop to the target fps (env is stepped once per
+            # iteration) so per-second speeds are stable across machines.
+            target = 1.0 / self._fps
+            if dt < target:
+                time.sleep(target - dt)
+
             # Reset if episode ended or gamepad button pressed.
             reset_requested = gp_buttons.get("reset", False) if gp_buttons else False
             next_ep = gp_buttons.get("next_episode", False) if gp_buttons else False
             if done or reset_requested or next_ep:
                 self._do_reset()
 
+        self._join_grounding_worker()
         if self._gamepad is not None and self._gamepad.connected:
             self._gamepad.close()
         cv2.destroyAllWindows()
@@ -300,7 +403,16 @@ class PushTInterface:
 
         while len(self._gt_aligned_frames) < needed:
             # Step the environment with zero action to collect frames.
-            obs, _, _, _ = self._env.step(np.array([0, 0]))
+            obs, _, _, info = self._env.step(
+                np.array([0, 0], dtype=np.float32))
+            # Keep _action_history indexed by absolute raw timestep — the
+            # async grounding worker looks up actions by self._timestep
+            # value, so a gap here (steps counted but not recorded) would
+            # desync every later index lookup by exactly this gap.
+            eff_action = info.get(
+                "effective_action", np.zeros(2, dtype=np.float32))
+            self._action_history.append(
+                np.asarray(eff_action, dtype=np.float32))
             self._frame_counter += 1
             if self._frame_counter % fs == 0:
                 self._gt_aligned_frames.append(obs["visual"].copy())
@@ -338,9 +450,28 @@ class PushTInterface:
             return np.array(KEY_ACTIONS[key], dtype=np.float32)
         return np.array([0, 0], dtype=np.float32)
 
+    def _get_timestep(self) -> int:
+        """GIL-atomic timestep read for the async grounding worker."""
+        return self._timestep
+
+    def _join_grounding_worker(self) -> None:
+        """Wait for the async grounding worker to finish (no cancellation).
+
+        Bounded: the worker completes its current rollout (~ceil(D/fs) model
+        steps) and exits on its own.
+        """
+        if self._grounding_thread is not None:
+            if self._grounding_thread.is_alive():
+                self._grounding_thread.join()
+            self._grounding_thread = None
+
     def _do_reset(self) -> None:
         """Reset environment and WM state."""
         print("[IF] episode finished — resetting...")
+        # The worker holds references to _action_history (cleared below) and
+        # reads _timestep (zeroed below) — join it before touching either.
+        self._join_grounding_worker()
+        self._last_grounded_ts = -1
         obs, state = self._env.reset()
         self._obs = obs
         self._state = state
@@ -408,6 +539,21 @@ class PushTInterface:
             canvas[:gt_inset.shape[0], x_off:x_off + gt_inset.shape[1]] = gt_inset
             gt_label = "delayed GT" if self._mode == "zli" else "env GT"
             _put_text(canvas, gt_label, (x_off + 2, 14), (200, 200, 200))
+
+            if self._mode == "zli":
+                # Third panel: the undelayed (live) GT, below the delayed one.
+                live_frame = self._obs["visual"] if self._obs is not None \
+                    else wm_frame
+                live_inset = _resize_to_fit(
+                    live_frame,
+                    int(self._display_size * GT_INSET_SCALE),
+                    int(main.shape[0] * GT_INSET_SCALE),
+                )
+                y_off = gt_inset.shape[0] + 2
+                canvas[y_off:y_off + live_inset.shape[0],
+                       x_off:x_off + live_inset.shape[1]] = live_inset
+                _put_text(canvas, "live GT", (x_off + 2, y_off + 14),
+                          (200, 200, 200))
 
         # Text overlay at bottom.
         y_base = main.shape[0] + 15

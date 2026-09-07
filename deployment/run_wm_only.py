@@ -39,8 +39,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="DINO-WM PushT world-model-only interaction")
     parser.add_argument(
-        "--ckpt", required=True,
-        help="path to checkpoints/ directory")
+        "--ckpt", default=None,
+        help="path to checkpoints/ directory (required unless --gt-only)")
+    parser.add_argument(
+        "--gt-only", action="store_true",
+        help="Run the ground-truth env only: no world model is loaded or "
+             "rolled out (the checkpoint is not needed).")
     parser.add_argument(
         "--ckpt_suffix", default="_latest",
         help="checkpoint suffix")
@@ -89,7 +93,23 @@ def main() -> None:
     ms.add_argument("--action-scale", type=float, default=0.1,
                     help="Maniskill action_scale (default: 0.1).")
     ms.add_argument("--step-size", type=float, default=0.02,
-                    help="Metres per step at full deflection (default: 0.02).")
+                    help="Metres per step at full deflection (default: 0.02 — "
+                         "matches gamepad_teleop_pusht.py --speed 0.020).")
+    ms.add_argument("--fixed-magnitude", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Unit-circle projection on commands (training-policy "
+                         "style: every non-idle move is action_scale m/step). "
+                         "Default: follow the policy checkpoint's setting when "
+                         "--policy-checkpoint is given, else off.  With the "
+                         "projection off, full deflection moves step_size "
+                         "m/step (teleop style, --speed in the other repo).")
+    ms.add_argument("--level-ee", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Actively level the end-effector back to vertical "
+                         "each step (delta mode), as in the training data. "
+                         "Default: follow the policy checkpoint's setting when "
+                         "--policy-checkpoint is given, else off (drot=0 — the "
+                         "stick stays tilted after collisions).")
     ms.add_argument("--push-height", type=float, default=0.015,
                     help="Fixed stick-tip height (m) (default: 0.015).")
     ms.add_argument("--sim-backend", default="physx_cuda",
@@ -126,15 +146,26 @@ def main() -> None:
         action_scale=args.action_scale,
         step_size=args.step_size,
         max_input=args.gamepad_speed if args.gamepad else 60.0,
+        fixed_magnitude=args.fixed_magnitude,
+        level_ee=args.level_ee,
         push_height=args.push_height,
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,
         with_velocity=not args.no_velocity,
     )
 
+    # GT-only runs skip the world model entirely (no checkpoint needed);
+    # otherwise the checkpoint directory is required for the WM adapter.
+    if args.gt_only:
+        mode = "passthrough"
+    else:
+        if args.ckpt is None:
+            parser.error("--ckpt is required unless --gt-only is given")
+        mode = "wm_only"
+
     iface = get_interface(
-        mode="wm_only",
-        wm_ckpt_dir=args.ckpt,
+        mode=mode,
+        wm_ckpt_dir=args.ckpt or "",
         wm_ckpt_suffix=args.ckpt_suffix,
         display_size=args.display_size,
         fps=args.fps,
