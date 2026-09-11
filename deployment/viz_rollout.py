@@ -8,7 +8,13 @@ on DINOv2 feature maps, and writes side-by-side MP4 videos:
 
     GT-RGB | GT-PCA | Pred-PCA
 
-With ``--pixel-decoder``: an additional row with GT-RGB | Pred-RGB is appended.
+With ``--pixel-decoder``: two additional rows are appended — the ORACLE
+reconstruction (GT-RGB | GT-Recon-RGB: raw GT latents pushed through the
+decoder, the model's ceiling) and the predicted pixels (GT-RGB | Pred-RGB).
+Comparing the recon row against the pred row localizes decode artifacts:
+if the recon row renders the T-block faithfully while the pred row shows
+vanish/snap, the information is lost in the LATENT (predictor/encoder);
+if both break, the decoder itself is the bottleneck.
 
 The model was trained with a frameskip factor — predictions are at frameskip
 intervals; the video shows every raw frame on the GT side and holds predictions
@@ -143,6 +149,12 @@ def viz_pusht_rollout(args) -> None:
     # ── locate checkpoint ──────────────────────────────────────────────────
     ckpt_path = os.path.join(args.ckpt, f"model{args.ckpt_suffix}.pth")
     print(f"loading checkpoint: {ckpt_path}")
+
+    # Checkpoints pickle legacy ``models.*`` module paths (training imported
+    # them from the dino_wm repo root) — alias them before unpickling.
+    from deployment.wm_adapter import _install_legacy_model_aliases
+    _install_legacy_model_aliases()
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     # ── load hydra config ───────────────────────────────────────────────────
@@ -250,7 +262,8 @@ def viz_pusht_rollout(args) -> None:
     agent.load_state_dict(policy_ckpt["agent"])
     agent.eval()
 
-    proprio_dim = 2 if targs.get("no_ee_vel", False) else 4
+    proprio_dim = (2 if targs.get("no_ee_vel", False) else 4) \
+        + (4 if args.with_block_pose else 0)  # + block xy + cos/sin (obs 4:8)
     print(
         f"env ready — control_mode={control_mode}  action_scale={action_scale:.4f}  "
         f"proprio_dim={proprio_dim}  obs_dim={policy_ckpt['obs_dim']}"
@@ -301,7 +314,12 @@ def viz_pusht_rollout(args) -> None:
             eff = env.effective_action(cmd)
             raw_actions.append(eff)
 
-            obs, _, _, _, _ = venv.step(cmd)
+            obs, _, term, trunc, _ = venv.step(cmd)
+            # Cut the collection at the episode boundary: the training data
+            # never contains cross-reset transitions, and the eval video
+            # must not show the auto-reset (or a rollout through it) either.
+            if bool(term.item()) or bool(trunc.item()):
+                break
 
         print(
             f"  episode {ep}: collected {len(frames_rgb)} frames"
@@ -362,14 +380,31 @@ def viz_pusht_rollout(args) -> None:
 
         # ── pixel decoding (optional) ──────────────────────────────────────
         pred_frames_rgb = None
+        recon_frames_rgb = None
         if has_decoder:
+            # Decode in chunks: decoding the whole rollout at once holds
+            # n_rollout × img_size² feature maps (OOMs small GPUs at 448²).
+            DECODE_CHUNK = 4
+
+            def _decode_chunked(z_obs: dict, n_frames: int) -> torch.Tensor:
+                chunks = []
+                for i in range(0, n_frames, DECODE_CHUNK):
+                    z_chunk = {
+                        k: v[:, i:i + DECODE_CHUNK] for k, v in z_obs.items()
+                    }
+                    chunk_decoded, _ = model.decode_obs(z_chunk)
+                    chunks.append(chunk_decoded["visual"][0])
+                return torch.cat(chunks, dim=0)
+
             with torch.no_grad():
-                rollout_decoded, _ = model.decode_obs(z_obs_rollout)
-            pred_frames_rgb = rollout_decoded["visual"][0]  # (n_rollout, 3, 224, 224)
+                # Oracle: decode the RAW GT latents — the decoder's ceiling.
+                recon_frames_rgb = _decode_chunked(z_gt_all, n_sub)
+                # Predictions: decode the rollout latents.
+                pred_frames_rgb = _decode_chunked(z_obs_rollout, n_rollout_frames)
 
         # ── build video ────────────────────────────────────────────────────
-        target_h = IMG_SIZE
-        target_w = IMG_SIZE
+        target_h = cfg.img_size
+        target_w = cfg.img_size
         gap = 2  # white separator width
 
         out_mp4 = os.path.join(args.out, f"pusht_rollout_{ep:02d}.mp4")
@@ -403,18 +438,23 @@ def viz_pusht_rollout(args) -> None:
 
             rows = [row1]
 
-            # Optional row 2: GT-RGB | Pred-RGB
-            if pred_frames_rgb is not None:
-                pred_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                if pk < len(pred_frames_rgb):
-                    pred_rgb = _tensor_to_uint8(pred_frames_rgb[pk])
-                    if pred_rgb.shape[0] != target_h:
-                        pred_rgb = cv2.resize(
-                            pred_rgb, (target_w, target_h),
+            def _rgb_panel(frames_rgb: torch.Tensor) -> np.ndarray:
+                """(n, 3, H, W) → uint8 panel at the subsampled index."""
+                out = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                if pk < len(frames_rgb):
+                    out = _tensor_to_uint8(frames_rgb[pk])
+                    if out.shape[0] != target_h:
+                        out = cv2.resize(
+                            out, (target_w, target_h),
                             interpolation=cv2.INTER_NEAREST,
                         )
-                row2 = np.concatenate([gt_rgb, sep, pred_rgb], axis=1)
-                # Pad row2 to match row1 width.
+                return out
+
+            # Optional row 2: GT-RGB | GT-Recon-RGB (oracle reconstruction —
+            # raw GT latents through the decoder; the decoder's ceiling).
+            if recon_frames_rgb is not None:
+                recon_rgb = _rgb_panel(recon_frames_rgb)
+                row2 = np.concatenate([gt_rgb, sep, recon_rgb], axis=1)
                 if row2.shape[1] < row1.shape[1]:
                     pad_w = row1.shape[1] - row2.shape[1]
                     row2 = np.concatenate(
@@ -422,6 +462,18 @@ def viz_pusht_rollout(args) -> None:
                         axis=1,
                     )
                 rows.append(row2)
+
+            # Optional row 3: GT-RGB | Pred-RGB
+            if pred_frames_rgb is not None:
+                pred_rgb = _rgb_panel(pred_frames_rgb)
+                row3 = np.concatenate([gt_rgb, sep, pred_rgb], axis=1)
+                if row3.shape[1] < row1.shape[1]:
+                    pad_w = row1.shape[1] - row3.shape[1]
+                    row3 = np.concatenate(
+                        [row3, np.ones((target_h, pad_w, 3), dtype=np.uint8) * 255],
+                        axis=1,
+                    )
+                rows.append(row3)
 
             frame = np.concatenate(rows, axis=0)
             writer.append_data(frame)
@@ -480,6 +532,12 @@ def main() -> None:
         "--pixel-decoder",
         action="store_true",
         help="include pixel-decoded prediction row",
+    )
+    ap.add_argument(
+        "--with-block-pose",
+        action="store_true",
+        help="append the T-block pose (xy + cos/sin) to the WM proprio "
+             "(4 -> 8 dims); must match the checkpoint's training flag",
     )
     ap.add_argument("--seed", type=int, default=42, help="random seed")
     ap.add_argument(

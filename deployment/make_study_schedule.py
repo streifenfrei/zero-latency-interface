@@ -27,6 +27,17 @@ Example
 Spare trials carry no delay/setting: a replacement inherits the condition of
 whatever trial was discarded.  They exist only to pre-commit the initial-pose
 seed, so a failed trial cannot be re-rolled into an easier configuration.
+
+TLX trials
+----------
+`do_tlx` marks the two trials per block (one per setting) after which the
+workload questionnaire is administered.  Each is the *second* trial of a
+same-setting run, so the rated trial is preceded by its own setting rather than
+by the other one -- this attenuates lag-1 contrast in the subjective ratings.
+Within that constraint the latest eligible position is chosen, so ratings
+describe settled rather than early-adaptation behaviour.  Which setting is rated
+first flips automatically with the block's starting setting, so rating order is
+counterbalanced across participants.
 """
 
 import argparse
@@ -80,14 +91,45 @@ def abba_pattern(trials_per_setting, start):
     return seq
 
 
+def tlx_positions(pattern):
+    """Pick one rated trial per setting from an ABBA pattern.
+
+    Returns ({setting_index: 1-indexed position}, clean) where `clean` is False
+    if some setting never occurs as the second trial of a same-setting run and
+    a fallback (its last occurrence) had to be used.
+
+    For the default ABBA with 4 trials per setting -- A B B A A B B A -- the
+    run-second positions are 3 (B), 5 (A) and 7 (B); the latest per setting are
+    5 and 7, which are also adjacent in time.
+    """
+    runs = {}
+    for i in range(1, len(pattern)):
+        if pattern[i] == pattern[i - 1]:
+            runs[pattern[i]] = i + 1        # keep the latest, 1-indexed
+
+    last = {}
+    for i, s in enumerate(pattern):
+        last[s] = i + 1
+
+    positions, clean = {}, True
+    for s in sorted(set(pattern)):
+        if s in runs:
+            positions[s] = runs[s]
+        else:
+            positions[s] = last[s]
+            clean = False
+    return positions, clean
+
+
 # --------------------------------------------------------------------------- #
 # Schedule generation
 # --------------------------------------------------------------------------- #
 
 def build_schedule(delays, trials, participants, cycle_length=None,
                    practice=0, spares=0, settings=("no_wm", "wm"),
-                   practice_delay=None, first_pid=1, seed_base=1000):
-    """Return (rows, cycle_length, n_orders) where rows is a list of dicts."""
+                   practice_delay=None, first_pid=1, seed_base=1000,
+                   tlx=True):
+    """Return (rows, cycle_length, n_orders, tlx_clean)."""
     orders = williams_square(len(delays))
     n_orders = len(orders)
     natural_cycle = n_orders * 2          # x2 for which setting starts a block
@@ -98,6 +140,7 @@ def build_schedule(delays, trials, participants, cycle_length=None,
     if practice_delay is None:
         practice_delay = min(delays)
 
+    tlx_clean = True
     rows = []
     for p in range(participants):
         pid = f"P{first_pid + p:03d}"
@@ -114,7 +157,7 @@ def build_schedule(delays, trials, participants, cycle_length=None,
                 participant_id=pid, schedule_row=r, phase="practice",
                 block_index=0, delay_n=practice_delay,
                 setting="none", trial_in_block=t + 1,
-                session_trial=trial_no, is_spare=0,
+                session_trial=trial_no, is_spare=0, do_tlx=False,
                 seed=seed_base + 10000 * p + trial_no,
             ))
 
@@ -124,6 +167,14 @@ def build_schedule(delays, trials, participants, cycle_length=None,
             # with block position within a participant
             block_start = (start_setting + b) % 2
             pattern = abba_pattern(trials, block_start)
+
+            if tlx:
+                tpos, clean = tlx_positions(pattern)
+                tlx_clean = tlx_clean and clean
+                rated = set(tpos.values())
+            else:
+                rated = set()
+
             for t, s in enumerate(pattern):
                 trial_no += 1
                 rows.append(dict(
@@ -131,6 +182,7 @@ def build_schedule(delays, trials, participants, cycle_length=None,
                     block_index=b + 1, delay_n=delays[d_idx],
                     setting=settings[s], trial_in_block=t + 1,
                     session_trial=trial_no, is_spare=0,
+                    do_tlx=(t + 1) in rated,
                     seed=seed_base + 10000 * p + trial_no,
                 ))
 
@@ -139,18 +191,19 @@ def build_schedule(delays, trials, participants, cycle_length=None,
         # discarded, so it is not pre-assigned here.  What is pre-committed is
         # the seed, which removes any freedom to re-roll the initial pose after
         # a failure.  Consume the pool in order and record which spare replaced
-        # which discarded trial.
+        # which discarded trial.  If the discarded trial was a rated one, run
+        # the questionnaire after its replacement instead.
         for k in range(spares):
             trial_no += 1
             rows.append(dict(
                 participant_id=pid, schedule_row=r, phase="spare",
                 block_index="", delay_n="", setting="",
                 trial_in_block=k + 1,
-                session_trial=trial_no, is_spare=1,
+                session_trial=trial_no, is_spare=1, do_tlx=False,
                 seed=seed_base + 10000 * p + trial_no,
             ))
 
-    return rows, cycle_length, n_orders
+    return rows, cycle_length, n_orders, tlx_clean
 
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +260,62 @@ def verify(rows, delays, settings, cycle_length, n_orders, participants):
         out.append(f"  {s:>7} : {sum(msp[s]) / len(msp[s]):.3f}")
     out.append("")
 
+    # ---- TLX placement --------------------------------------------------- #
+    rated = [r for r in main if r["do_tlx"]]
+    if rated:
+        out.append("TLX-rated trials:")
+        per_p = len(rated) // participants
+        out.append(f"  per participant : {per_p}"
+                   f"  ({per_p // len(blocks)} per block)")
+
+        cell = Counter((r["delay_n"], r["setting"]) for r in rated)
+        cnts = sorted(cell.values())
+        out.append(f"  per (delay, setting) cell : min {cnts[0]}, "
+                   f"max {cnts[-1]}"
+                   + ("  (equal)" if cnts[0] == cnts[-1] else "  (UNEQUAL)"))
+        if cnts[0] != cnts[-1]:
+            ok = False
+
+        out.append("  positions used : "
+                   + ", ".join(str(x) for x in
+                               sorted({r["trial_in_block"] for r in rated})))
+
+        # is each rated trial preceded by a trial of its own setting?
+        by_key = defaultdict(dict)
+        for r in main:
+            by_key[(r["participant_id"], r["block_index"])][
+                r["trial_in_block"]] = r["setting"]
+        same = diff = 0
+        for r in rated:
+            blk = by_key[(r["participant_id"], r["block_index"])]
+            prev = blk.get(r["trial_in_block"] - 1)
+            if prev is not None and prev == r["setting"]:
+                same += 1
+            else:
+                diff += 1
+        out.append(f"  preceded by same setting : {same}/{same + diff}"
+                   + ("  (lag-1 contrast attenuated)" if diff == 0
+                      else "  (SOME follow the other setting)"))
+        if diff:
+            ok = False
+
+        # which setting gets rated first within a block
+        first, seen = Counter(), set()
+        for r in sorted(rated, key=lambda x: (x["participant_id"],
+                                              x["block_index"],
+                                              x["trial_in_block"])):
+            key = (r["participant_id"], r["block_index"])
+            if key not in seen:
+                seen.add(key)
+                first[r["setting"]] += 1
+        out.append("  rated first within block : "
+                   + ", ".join(f"{s} {first[s]}" for s in settings))
+        fc = sorted(first.values())
+        if len(fc) > 1 and fc[0] != fc[-1]:
+            out.append("      (UNBALANCED rating order)")
+            ok = False
+        out.append("")
+
     # first-order carryover between delay blocks
     out.append("delay->delay carryover pairs (want equal counts):")
     pairs = Counter()
@@ -249,7 +358,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Generate a counterbalanced user-study schedule.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--delays", type=int, nargs="+", default=[10, 15, 20, 25],
+    ap.add_argument("--delays", type=int, nargs="+", default=[10, 15, 20],
                     help="delay conditions")
     ap.add_argument("--trials", type=int, default=4,
                     help="measured trials per setting per delay block "
@@ -269,6 +378,8 @@ def main(argv=None):
                     help="delay used during practice (default: lowest delay)")
     ap.add_argument("--settings", nargs=2, default=["no_wm", "wm"],
                     metavar=("A", "B"), help="the two setting labels")
+    ap.add_argument("--no-tlx", action="store_true",
+                    help="do not mark any trial for the TLX questionnaire")
     ap.add_argument("--first-pid", type=int, default=1,
                     help="numeric part of the first participant id")
     ap.add_argument("--seed-base", type=int, default=1000,
@@ -284,15 +395,15 @@ def main(argv=None):
     if a.trials < 1:
         ap.error("--trials must be >= 1")
 
-    rows, cycle_length, n_orders = build_schedule(
+    rows, cycle_length, n_orders, tlx_clean = build_schedule(
         delays=a.delays, trials=a.trials, participants=a.participants,
         cycle_length=a.cycle_length, practice=a.practice, spares=a.spares,
         settings=tuple(a.settings), practice_delay=a.practice_delay,
-        first_pid=a.first_pid, seed_base=a.seed_base)
+        first_pid=a.first_pid, seed_base=a.seed_base, tlx=not a.no_tlx)
 
     fields = ["participant_id", "schedule_row", "phase", "block_index",
               "delay_n", "setting", "trial_in_block", "session_trial",
-              "is_spare", "seed"]
+              "is_spare", "do_tlx", "seed"]
     with open(a.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -307,6 +418,11 @@ def main(argv=None):
             print(f"WARNING: cycle length {a.cycle_length} != natural "
                   f"{n_orders * 2}; carryover balance is not guaranteed.",
                   file=sys.stderr)
+        if not tlx_clean:
+            print(f"WARNING: with --trials {a.trials}, at least one setting "
+                  "never occurs as the second trial of a same-setting run, so "
+                  "a rated trial follows the other setting and lag-1 contrast "
+                  "is not attenuated. Use --trials 3 or more.", file=sys.stderr)
         if not ok:
             print("NOTE: schedule is not perfectly balanced -- see above. "
                   "Stop recruitment at a multiple of the cycle length, or "

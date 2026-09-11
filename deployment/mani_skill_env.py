@@ -77,6 +77,10 @@ class ManiSkillPushTEnv:
         ManiSkill simulation backend.  Default ``"physx_cuda"``.
     with_velocity:
         Include EE velocity in proprio.  Default ``True``.
+    with_block_pose:
+        Append the T-block pose (xy + cos/sin, compact-obs dims 4:8) to the
+        WM proprio, making it 8-dim (4-dim default).  Must match the flag
+        the checkpoint was TRAINED with (``training/pusht_online.py``).
     goal_tolerance:
         Required overlap fraction (0..1) between the pushed T-block and the
         goal T for task success — ManiSkill's ``intersection_thresh``.
@@ -103,6 +107,7 @@ class ManiSkillPushTEnv:
         max_episode_steps: int = 100_000,
         sim_backend: str = "physx_cuda",
         with_velocity: bool = True,
+        with_block_pose: bool = False,
         goal_tolerance: float = 0.90,
         seed: int = 0,
     ) -> None:
@@ -210,7 +215,8 @@ class ManiSkillPushTEnv:
             record_metrics=False,
         )
 
-        self.proprio_dim: int = 2 if _no_ee_vel else 4
+        self.proprio_dim: int = (2 if _no_ee_vel else 4) \
+            + (4 if with_block_pose else 0)  # + block xy + cos/sin (obs 4:8)
         self.state_dim: int = self._wrapper.obs_dim
 
         self._device = self._venv.device

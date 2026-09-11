@@ -6,7 +6,7 @@ passes with warmup; reports parameter counts, per-op latency (mean ± std),
 rollout throughput (predicted frames/sec), and peak GPU memory.
 
 Usage:
-  python deployment/profile.py \
+  python deployment/profile_inference.py \
     --ckpt outputs/outputs/2026-07-06/18-46-23/checkpoints \
     --n_warmup 10 --n_timed 50
 """

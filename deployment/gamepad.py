@@ -137,6 +137,11 @@ class GamepadInput:
         self._joystick = None
         self._prev_buttons: dict[int, bool] = {}
         self._connected: bool = False
+        # Independent latch for the right-hand face buttons (A/B/X/Y —
+        # cross/circle/square/triangle on PS): read() consumes the A/B/Y
+        # edges for its own mapping, so prompt screens track their own.
+        self._right_latched: bool = False
+        self._b_latched: bool = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -284,6 +289,46 @@ class GamepadInput:
         was = self._prev_buttons.get(idx, False)
         self._prev_buttons[idx] = cur
         return cur and not was
+
+    def any_right_button_pressed(self) -> bool:
+        """Edge-triggered: True on the tick the A face button (index 0 —
+        cross on PS, bottom of the four) goes down.
+
+        The study UI restricts participant progress to A only; the other
+        three face buttons do nothing.  Uses independent state so
+        :meth:`read`'s own edge tracking is untouched; must be called
+        once per tick (like :meth:`read`).
+        """
+        js = self._joystick
+        if js is None:
+            return False
+        down = bool(js.get_button(0))
+        fired = down and not self._right_latched
+        self._right_latched = down
+        return fired
+
+    def hat_x(self) -> int:
+        """Current D-pad x direction: -1, 0, or +1 (0 if no hat)."""
+        js = self._joystick
+        if js is None or js.get_numhats() == 0:
+            return 0
+        return int(js.get_hat(0)[0])
+
+    def b_button_pressed(self) -> bool:
+        """Edge-triggered: True on the tick the B face button (index 1 —
+        circle on PS) goes down.
+
+        Used by the questionnaire to go back one scale.  Independent latch
+        so :meth:`read`'s edge tracking is untouched; must be called once
+        per tick.
+        """
+        js = self._joystick
+        if js is None:
+            return False
+        down = bool(js.get_button(1))
+        fired = down and not self._b_latched
+        self._b_latched = down
+        return fired
 
     def reset_button_state(self) -> None:
         """Clear edge-trigger state (call after handling button events)."""

@@ -18,5 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libX11.so.6:/usr/lib/x86_64-linux-gnu/libxcb.so.1${LD_PRELOAD:+:${LD_PRELOAD}}"
 export LIBGL_DRI3_DISABLE=1
+# Real window for the study UI (gamepad.py pins SDL_VIDEODRIVER=dummy for
+# its headless pad reader; set this first so the x11 driver wins).
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
 
 exec "$SCRIPT_DIR/../.venv/bin/python" -u "$SCRIPT_DIR/run_study.py" "$@"

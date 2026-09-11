@@ -44,6 +44,11 @@ dataset:
   val_ratio: 0.1             # fraction of chunks routed to validation
   samples_per_epoch: 50000   # samples yielded per epoch by the iterable dataset
 
+  # --- world-model proprio ---------------------------------------------------
+  with_block_pose: false     # append T-block pose (xy + cos/sin) to the WM
+                             # proprio (4 -> 8 dims); must match the flag used
+                             # at inference time for a given checkpoint
+
   # --- device / sim ----------------------------------------------------------
   device: cuda
   sim_backend: physx_cuda    # required for batched on-device rendering

@@ -119,6 +119,11 @@ def main() -> None:
                     help="Per-episode horizon (default: 100000).")
     ms.add_argument("--no-velocity", action="store_true",
                     help="Exclude EE velocity from proprio (default: include).")
+
+    ms.add_argument("--with-block-pose", action="store_true",
+                    help="Append the T-block pose (xy + cos/sin) to the "
+                         "WM proprio (4 -> 8 dims).  Must match the flag "
+                         "the checkpoint was trained with.")
     args = parser.parse_args()
 
     # ── gamepad setup ──────────────────────────────────────────────────────
@@ -152,6 +157,7 @@ def main() -> None:
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,
         with_velocity=not args.no_velocity,
+        with_block_pose=args.with_block_pose,
     )
 
     # GT-only runs skip the world model entirely (no checkpoint needed);

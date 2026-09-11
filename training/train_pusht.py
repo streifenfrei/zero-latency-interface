@@ -72,12 +72,16 @@ def main() -> None:
                         help="Resume from a specific checkpoint path")
 
     # Misc.
-    parser.add_argument("--extra-hydra", type=str, nargs="*", default=[],
-                        help="Additional Hydra overrides (e.g. 'training.lr=0.001')")
+    parser.add_argument("--extra-hydra", type=str, nargs="*", action="append",
+                        default=[],
+                        help="Additional Hydra overrides (e.g. 'training.lr=0.001'); "
+                             "repeatable, or pass several after one flag")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the command without executing")
 
     args = parser.parse_args()
+    # action="append" produces a list of lists — flatten.
+    args.extra_hydra = [o for group in args.extra_hydra for o in group]
 
     # Determine environment config.
     if args.online:
@@ -114,7 +118,8 @@ def main() -> None:
         ]
 
     if args.resume:
-        overrides.append(f"resume={args.resume}")
+        # "+" appends the key — conf/train.yaml does not define "resume".
+        overrides.append(f"+resume={args.resume}")
 
     if args.extra_hydra:
         overrides.extend(args.extra_hydra)

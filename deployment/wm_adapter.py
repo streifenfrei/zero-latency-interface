@@ -111,10 +111,14 @@ class DinoWMPushtAdapter:
         ckpt_dir: str,
         ckpt_suffix: str = "_latest",
         device: Optional[str] = None,
+        use_amp: bool = False,
     ) -> None:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = torch.device(device)
+        self._use_amp = use_amp and self._device.type == "cuda"
+        if self._use_amp:
+            print("[WM] mixed precision (fp16 autocast) enabled")
 
         # --- load checkpoint & config -----------------------------------------
         _install_legacy_model_aliases()
@@ -204,6 +208,11 @@ class DinoWMPushtAdapter:
         self._last_grounding_ts: int = -1
         # Per-step chain logging is noisy (every frameskip ticks) — opt in.
         self._log_chain: bool = os.environ.get("ZLI_LOG_CHAIN", "0") != "0"
+
+    def _amp_ctx(self):
+        """Autocast context for model forwards (fp16 where CUDA allows)."""
+        return torch.autocast(device_type="cuda", dtype=torch.float16,
+                              enabled=self._use_amp)
 
     # -- public API ------------------------------------------------------------
 
@@ -403,7 +412,7 @@ class DinoWMPushtAdapter:
             # lookahead frame we never use.  The prediction after the last
             # applied action is frame num_hist + n_wm_steps - 1 — decode only
             # that frame (the decoder dominates cost at large delays).
-            with torch.no_grad():
+            with torch.no_grad(), self._amp_ctx():
                 z_obs, _ = self._model.rollout(obs_0, act_tensor)
 
             if n_wm_steps > 0:
@@ -471,7 +480,7 @@ class DinoWMPushtAdapter:
 
         # Encode the context ONCE (DINO encoder + proprio/action tiling).
         with self._lock:
-            with torch.no_grad():
+            with torch.no_grad(), self._amp_ctx():
                 z = self._model.encode(obs_0, act_0_t)
 
         # Chase loop: roll one WM step at a time while the NEXT model frame
@@ -498,7 +507,7 @@ class DinoWMPushtAdapter:
                     action_history, gt_ts, H + rolled, target)
                 act_t = torch.from_numpy(chunk).view(1, 1, -1).to(self._device)
                 with self._lock:
-                    with torch.no_grad():
+                    with torch.no_grad(), self._amp_ctx():
                         z_pred = self._model.predict(z[:, -H:])
                         z_new = z_pred[:, -1:]
                         z_new = self._model.replace_actions_from_z(z_new, act_t)
@@ -518,7 +527,7 @@ class DinoWMPushtAdapter:
         # the action buffer so the chain stays exactly aligned with the
         # present instead of dropping them.
         with self._lock:
-            with torch.no_grad():
+            with torch.no_grad(), self._amp_ctx():
                 z_obses, _ = self._model.separate_emb(z)
                 tail = {
                     "visual": z_obses["visual"][:, -H:],
@@ -709,7 +718,7 @@ class DinoWMPushtAdapter:
         # Manual single step (encode → predict → append), skipping the extra
         # lookahead frame that model.rollout always appends — with frameskip=1
         # that wasted predictor forward runs EVERY tick.
-        with torch.no_grad():
+        with torch.no_grad(), self._amp_ctx():
             z = self._model.encode(obs_0, act_tensor[:, :self.num_hist])
             z_pred = self._model.predict(z[:, -self.num_hist:])
             z_new = z_pred[:, -1:]

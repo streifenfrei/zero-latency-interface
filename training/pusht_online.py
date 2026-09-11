@@ -67,6 +67,7 @@ class PushTOnlineProvider:
         chunk_length: int = 4,
         frameskip: int = 5,
         img_size: int = 224,
+        camera_res: int | None = None,
         val_ratio: float = 0.1,
         noise_kind: str = "random",
         idle_fraction: float = 0.5,
@@ -77,6 +78,7 @@ class PushTOnlineProvider:
         sim_backend: str = "physx_cuda",
         seed: int = 0,
         buffer_size: int | None = None,
+        with_block_pose: bool = False,
     ) -> None:
         if noise_kind not in ("random", "idle", "mixed"):
             raise ValueError(
@@ -89,6 +91,9 @@ class PushTOnlineProvider:
         self.chunk_length = chunk_length
         self.frameskip = frameskip
         self.img_size = img_size
+        # ManiSkill PushT base_camera defaults to 128×128 — render at least
+        # at img_size or the images carry no detail above the camera res.
+        self.camera_res = camera_res or img_size
         self.val_ratio = val_ratio
         self.noise_kind = noise_kind
         self.idle_fraction = idle_fraction
@@ -101,6 +106,7 @@ class PushTOnlineProvider:
         self.buffer_size = (
             buffer_size if buffer_size is not None else max(num_envs * 4, 256)
         )
+        self.with_block_pose = with_block_pose
 
         # Lazily built in setup().
         self._venv = None
@@ -178,6 +184,10 @@ class PushTOnlineProvider:
             ee_init_radius_min=targs.get("ee_init_radius_min", 0.12),
             sim_backend=self.sim_backend,
             max_episode_steps=self.max_episode_steps,
+            sensor_configs={
+                "width": self.camera_res,
+                "height": self.camera_res,
+            },
         )
         env = PushTXYWrapper(
             env,
@@ -217,8 +227,10 @@ class PushTOnlineProvider:
         # Set dimension attributes that the Trainer reads for encoder init.
         # action_dim: raw dim × frameskip (matches TrajSlicerDataset concat).
         self.action_dim = ckpt["act_dim"] * self.frameskip
-        # proprio: ee_xy + (optional) ee_vel — first N dims of the compact obs.
-        self.proprio_dim = 2 if targs.get("no_ee_vel", False) else 4
+        # proprio: ee_xy + (optional) ee_vel — first N dims of the compact
+        # obs — plus (optional) the T-block pose (xy + cos/sin, dims 4:8).
+        self.proprio_dim = (2 if targs.get("no_ee_vel", False) else 4) \
+            + (4 if self.with_block_pose else 0)
         self.state_dim = ckpt["obs_dim"]
 
         # Initial reset.
@@ -228,7 +240,7 @@ class PushTOnlineProvider:
         log.info(
             "PushTOnlineProvider: %d envs, p ∈ [%.3f, %.3f], noise=%s, "
             "control_mode=%s, T=%d, fk=%d, action_dim=%d, proprio_dim=%d, "
-            "state_dim=%d, action_scale=%.4f",
+            "state_dim=%d, action_scale=%.4f, block_pose=%s",
             self.num_envs,
             self.noise_p_min,
             self.noise_p_max,
@@ -240,6 +252,7 @@ class PushTOnlineProvider:
             self.proprio_dim,
             self.state_dim,
             action_scale,
+            self.with_block_pose,
         )
 
         # Start producer thread.
