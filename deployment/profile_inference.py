@@ -93,6 +93,12 @@ def profile(args):
     print(f"warmup={args.n_warmup}  timed={args.n_timed}")
 
     # --- load model -----------------------------------------------------------
+    # Checkpoints trained before the models.* → dino_wm.models namespace move
+    # pickle under the old import paths — the same alias shim the adapter
+    # installs is needed here too or torch.load fails with
+    # "No module named 'models'".
+    from deployment.wm_adapter import _install_legacy_model_aliases
+    _install_legacy_model_aliases()
     ckpt_path = os.path.join(args.ckpt, f"model{args.ckpt_suffix}.pth")
     print(f"\nloading: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)

@@ -80,6 +80,7 @@ TEXT = (232, 231, 227)         # primary text
 MUTED = (160, 159, 153)        # secondary text
 ACCENT = (42, 120, 214)        # button fill (blue #2a78d6)
 BORDER = (110, 109, 105)       # secondary outlines
+NOTICE = (207, 141, 24)        # heads-up pill (amber) on prompt screens
 FONT_HEAD = cv2.FONT_HERSHEY_DUPLEX
 
 # CSV schemas live in study_schema.py so analysis tools can import them
@@ -90,6 +91,22 @@ from deployment.study_schema import (  # noqa: E402
 
 
 # ── schedule / CSV helpers ───────────────────────────────────────────────────
+
+def _dynamo_compiles() -> int:
+    """Total torch.compile graph compilations so far (0 if compile unused).
+
+    All intended compilations happen at startup (adapter construction warmup),
+    so any increase during a run means a lazy recompilation stalled a tick
+    inside the measured window — run_row records the per-run delta in the
+    results CSV.
+    """
+    try:
+        from torch._dynamo.utils import counters
+        return int(counters["frames"]["total"])
+    except Exception:
+        return 0
+
+
 
 def load_schedule(path: Path) -> dict[str, list[dict]]:
     """participant_id -> rows in CSV order (spare rows dropped)."""
@@ -355,6 +372,20 @@ def make_frame_canvas(img: np.ndarray, w: int, h: int) -> np.ndarray:
     return canvas
 
 
+def loading_canvas(w: int, h: int, line1: str, line2: str = "") -> np.ndarray:
+    """Full-window status canvas (loading / please-wait screens)."""
+    canvas = np.full((h, w, 3), BG, dtype=np.uint8)
+
+    def centered(text: str, y: int, color, scale: float) -> None:
+        (tw, _), _ = cv2.getTextSize(text, FONT, scale, 1)
+        _put(canvas, text, ((w - tw) // 2, y), color, scale)
+
+    centered(line1, h // 2 - 14, TEXT, 0.8)
+    if line2:
+        centered(line2, h // 2 + 24, MUTED, 0.55)
+    return canvas
+
+
 def poll_input(gamepad):
     """One input-poll tick over the pygame window + gamepad.
 
@@ -418,6 +449,7 @@ def wait_for_button(gamepad, W: int, H: int,
                     gamepad_continue: bool = False,
                     hidden_keys: dict = None,
                     lines_above: bool = False,
+                    notices: list = None,
                     ) -> tuple[Optional[str], bool]:
     """Show a prompt screen until a button is clicked or ESC is pressed.
 
@@ -427,14 +459,23 @@ def wait_for_button(gamepad, W: int, H: int,
     maps keycodes to button ids for keyboard-only actions that have NO
     visible button (e.g. a supervisor-only retry).  With ``lines_above``,
     the ``lines`` are anchored just above the topmost button instead of a
-    fixed position.
+    fixed position.  ``notices`` is a list of (text, color) pairs rendered
+    as filled pills below the subtitle (e.g. "Questionnaire after next
+    run.").
     """
     hidden_keys = hidden_keys or {}
+    notices = notices or []
     while True:
         canvas = np.full((H, W, 3), BG, dtype=np.uint8)
         _put(canvas, title, (32, 48), TEXT, 0.85, font=FONT_HEAD)
         if subtitle:
             _put(canvas, subtitle, (32, 88), MUTED, 0.55)
+        for i, (txt, col) in enumerate(notices):
+            y0 = 112 + i * 38
+            (tw, th), _ = cv2.getTextSize(txt, FONT, 0.55, 2)
+            _rounded_rect(canvas, 32, y0, 32 + tw + 30, y0 + th + 16, 8,
+                          col, -1)
+            _put(canvas, txt, (47, y0 + th + 5), BG, 0.55, 2)
         if lines:
             if lines_above:
                 y_end = min(b.rect[1] for b in buttons) - 16
@@ -477,17 +518,22 @@ def _row_label(row: dict) -> str:
 
 
 def inter_run_prompt(gamepad, W: int, H: int, run_label: str,
-                     next_label: str, completed_run: bool) -> Optional[str]:
+                     next_label: str, completed_run: bool,
+                     do_tlx: bool = False) -> Optional[str]:
     """THE single prompt between runs — blinded and metric-free.
 
     ``run_label``/``next_label`` are the practice/main counters
     ("Practice - X/10" / "Trial - X/24") — they carry no condition info.
     Retry is keyboard-only (R, invisible) — no button, no hint.
+    ``do_tlx``: the upcoming run is followed by the TLX questionnaire —
+    announce it beforehand on a color-coded pill.
 
     ``completed_run=False``: start prompt before a run (first run, or
     after an abort).  ``completed_run=True``: concludes the run that just
     finished.  Returns 'advance', 'retry', or None (ESC → home).
     """
+    tlx_notice = ([("Questionnaire after next run.", NOTICE)]
+                  if do_tlx else [])
     if not completed_run:
         buttons = [Button("advance", (W // 2 - 130, int(H * 0.62) - 28,
                                       W // 2 + 130, int(H * 0.62) + 28),
@@ -496,7 +542,7 @@ def inter_run_prompt(gamepad, W: int, H: int, run_label: str,
             gamepad, W, H, buttons, "Get ready",
             run_label,[],
             primary_id="advance", gamepad_continue=True,
-            lines_above=True)
+            lines_above=True, notices=tlx_notice)
         return "advance" if bid == "advance" else None
 
     buttons = [
@@ -510,7 +556,8 @@ def inter_run_prompt(gamepad, W: int, H: int, run_label: str,
         f"",
         [],
         primary_id="advance", gamepad_continue=True,
-        hidden_keys={ord("r"): "retry"})
+        hidden_keys={ord("r"): "retry"},
+        notices=tlx_notice)
     if esc:
         return None
     return bid if bid in ("advance", "retry") else "advance"
@@ -640,7 +687,7 @@ TLX_SCALES = [
      "Very low", "Very high"),
     ("Performance",
      "How successful were you in accomplishing what you were asked to do?",
-     "Perfect", "Failure"),
+     "Failure", "Perfect"),
     ("Frustration",
      "How insecure, discouraged, irritated, stressed and annoyed were you?",
      "Very low", "Very high"),
@@ -875,6 +922,14 @@ def _run_wm(env, wm: DinoWMPushtAdapter, gamepad, W: int, H: int,
         _win.show(canvas)
 
     wm.reset(gt_frames[-needed:], gt_proprios[-needed:])
+    # One real-pattern model step BEFORE the measured window: if anything
+    # about the compiled graphs still lazy-initialises (cudagraph capture, a
+    # missed shape specialisation), it lands here instead of stalling a tick
+    # inside the timer.  Then re-ground so the run starts from the pristine
+    # context.
+    for _ in range(fs):
+        wm.predict(np.zeros(2, dtype=np.float32))
+    wm.reset(gt_frames[-needed:], gt_proprios[-needed:])
     display_frame = gt_frames[-1]
     delay = ConstantDelay(delay_steps)
     grounding_thread = None
@@ -974,6 +1029,7 @@ def run_row(env, wm, gamepad, W: int, H: int, row: dict,
     collect_pairs = (row["setting"] == "wm")
     metrics = RunMetrics(fps=fps, collect_pairs=collect_pairs)
     metrics.start()
+    compiles_before = _dynamo_compiles()
     if row["phase"] == "practice":
         result = _run_gt(env, gamepad, W, H, timeout_minutes, fps, metrics,
                          run_label)
@@ -984,6 +1040,11 @@ def run_row(env, wm, gamepad, W: int, H: int, row: dict,
         result = _run_delayed(env, gamepad, W, H, row["delay_n"],
                               timeout_minutes, fps, metrics, run_label)
     metrics_dict = metrics.finalize(discard=(result is None))
+    # Any dynamo compilation during the run itself would have stalled a tick
+    # inside the measured window (inflating completion_time_s / tick-rate
+    # metrics) — record it so analysis can quarantine such rows.
+    metrics_dict["recompiles_during_run"] = \
+        _dynamo_compiles() - compiles_before
     return result, metrics_dict
 
 
@@ -996,6 +1057,19 @@ def parse_args() -> argparse.Namespace:
                         help="path to checkpoints/ directory (world model)")
     parser.add_argument("--ckpt_suffix", default="_latest")
     parser.add_argument("--display_size", type=int, default=840)
+    parser.add_argument("--amp", action="store_true",
+                        help="mixed precision (fp16 autocast) for the "
+                             "world model")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the world model's inference "
+                             "(context encode, autoregressive step, decode) "
+                             "to accelerate ticks; compiles during startup "
+                             "and keeps only paths measurably faster than "
+                             "eager")
+    parser.add_argument("--compile-mode", default="default",
+                        choices=["default", "reduce-overhead"],
+                        help="torch.compile mode (default: %(default)s — "
+                             "reduce-overhead adds CUDA graphs)")
     parser.add_argument("--fps", type=int, default=10,
                         help="tick rate for ALL conditions (comparable "
                              "wall-clock times; default 20)")
@@ -1047,6 +1121,13 @@ def parse_args() -> argparse.Namespace:
                     help="Append the T-block pose (xy + cos/sin) to the "
                          "WM proprio (4 -> 8 dims).  Must match the flag "
                          "the checkpoint was trained with.")
+    ms.add_argument("--workspace-bounds", nargs=4, type=float, default=(-0.35, 0.1, -0.40, 0.40),
+                    metavar=("XMIN", "XMAX", "YMIN", "YMAX"),
+                    help="End-effector workspace in world metres "
+                         "(xmin xmax ymin ymax): the stick's commanded "
+                         "position is clamped to this rectangle — actions "
+                         "are clipped only when a step would cross a border "
+                         "(default: unbounded).")
     return parser.parse_args()
 
 
@@ -1068,7 +1149,20 @@ def main() -> None:
         )
         gamepad.setup()
 
-    wm = DinoWMPushtAdapter(ckpt_dir=args.ckpt, ckpt_suffix=args.ckpt_suffix)
+    # Open the study window BEFORE the world model: with --compile the
+    # adapter builds and warms the inference graphs at construction (can take
+    # a minute on first launch), so show a loading screen while it runs.
+    W, H = args.display_size, int(args.display_size * 0.6)
+    global _win
+    _win = _StudyWindow(WINDOW_NAME, W, H)
+    if args.compile:
+        _win.show(loading_canvas(
+            W, H, "Compiling world model...",
+            "torch.compile inference graphs — first launch can take a minute"))
+
+    wm = DinoWMPushtAdapter(ckpt_dir=args.ckpt, ckpt_suffix=args.ckpt_suffix,
+                            use_amp=args.amp, torch_compile=args.compile,
+                            compile_mode=args.compile_mode)
     env_kwargs = dict(
         env_id=args.env_id,
         zero_latency_root=args.zero_latency_root,
@@ -1085,6 +1179,8 @@ def main() -> None:
         with_velocity=not args.no_velocity,
         with_block_pose=args.with_block_pose,
         goal_tolerance=args.goal_tolerance,
+        workspace_bounds=tuple(args.workspace_bounds)
+        if args.workspace_bounds else None,
         render_size=wm.img_size,
     )
     env = ManiSkillPushTEnv(**env_kwargs)
@@ -1099,10 +1195,6 @@ def main() -> None:
     completed, attempts, max_trial_id = load_results(results_path)
     print(f"[STUDY] schedule: {len(schedule)} participants, "
           f"{sum(len(v) for v in schedule.values())} non-spare runs")
-
-    W, H = args.display_size, int(args.display_size * 0.6)
-    global _win
-    _win = _StudyWindow(WINDOW_NAME, W, H)
 
     def mk_button(id_: str, x1: int, x2: int, label: str,
                   key=None, centered: bool = False) -> Button:
@@ -1232,11 +1324,14 @@ def main() -> None:
 
                 if last_saved:
                     # Conclude the just-saved run; 'advance' runs the
-                    # current row immediately (no second prompt).
+                    # current row immediately (no second prompt).  Announce
+                    # here if THIS upcoming run is followed by the TLX
+                    # questionnaire.
                     choice = inter_run_prompt(
                         gamepad, W, H, run_label(row),
                         run_label(rows[i + 1]) if i + 1 < len(rows) else "",
-                        completed_run=True)
+                        completed_run=True,
+                        do_tlx=bool(row.get("do_tlx")))
                     if choice is None:
                         break
                     if choice == "retry":
@@ -1247,11 +1342,14 @@ def main() -> None:
                         attempt = attempts.get(key_r, 0) + 1
                         attempts[key_r] = attempt
                     last_saved = False
-                elif not first_run:
-                    # Start prompt (after an abort).
+                elif not first_run or row.get("do_tlx"):
+                    # Start prompt (after an abort — or before a first run
+                    # that is followed by the TLX questionnaire, so the
+                    # announcement screen is seen beforehand).
                     choice = inter_run_prompt(
                         gamepad, W, H, run_label(row), "",
-                        completed_run=False)
+                        completed_run=False,
+                        do_tlx=bool(row.get("do_tlx")))
                     if choice is None:
                         break
                 else:

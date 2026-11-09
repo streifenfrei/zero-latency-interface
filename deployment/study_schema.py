@@ -11,6 +11,7 @@ METRIC_FIELDS = [
     "ssim_mean", "ssim_std", "lpips_mean", "n_pairs", "n_pairs_dropped",
     "tick_rate_mean_hz", "tick_rate_min_hz",
     "completion_ticks",
+    "recompiles_during_run",
 ]
 
 FIELDNAMES = [

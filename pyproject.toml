@@ -26,6 +26,7 @@ dependencies = [
     "tensorboard>=2.15",
     "transformers>=4.21",
     "huggingface-hub>=0.23",
+    "statsmodels>=0.14.4",
 ]
 
 [project.optional-dependencies]

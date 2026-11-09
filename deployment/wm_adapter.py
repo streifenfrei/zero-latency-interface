@@ -87,6 +87,26 @@ def _tensor_to_np(t: torch.Tensor) -> np.ndarray:
     return x
 
 
+def _canonical_strides(t: torch.Tensor) -> torch.Tensor:
+    """Materialise t with canonical C strides if it doesn't already have them.
+
+    torch.compile guards compare EXACT strides.  ``Tensor.contiguous()`` is
+    not enough here: PyTorch treats a tensor as contiguous whenever the only
+    stride anomaly is a size-1 dim, so slices of a larger parent (e.g.
+    ``act[:, :H]`` of a longer action tensor, or ``z[:, -H:]`` of a grown
+    chain) pass ``is_contiguous()`` while keeping the parent's row stride —
+    feeding one of those to a compiled graph recompiles it on the first
+    real call.  This always yields the canonical layout (and a real copy
+    only when the strides are off).
+    """
+    canon = [1] * t.dim()
+    for i in range(t.dim() - 2, -1, -1):
+        canon[i] = canon[i + 1] * t.shape[i + 1]
+    if tuple(t.stride()) == tuple(canon):
+        return t
+    return t.clone(memory_format=torch.contiguous_format)
+
+
 # ── adapter ─────────────────────────────────────────────────────────────────
 
 class DinoWMPushtAdapter:
@@ -100,6 +120,14 @@ class DinoWMPushtAdapter:
         Suffix for the checkpoint file (e.g. ``_latest``).
     device:
         Torch device string.  Defaults to ``cuda`` if available.
+    torch_compile:
+        ``torch.compile`` the three fixed-shape inference entry points
+        (context encode, single autoregressive step, decode).  Compilation is
+        triggered by a warmup pass at construction time so no study tick ever
+        pays it; a checkpoint that fails to compile falls back to eager.
+    compile_mode:
+        ``torch.compile`` mode ("default" or "reduce-overhead").  Ignored
+        without ``torch_compile``.
 
     Key attributes (matching the telemanipulation_client WorldModel interface):
       - ``context_length`` : number of subsampled context frames (= num_hist)
@@ -112,6 +140,8 @@ class DinoWMPushtAdapter:
         ckpt_suffix: str = "_latest",
         device: Optional[str] = None,
         use_amp: bool = False,
+        torch_compile: bool = False,
+        compile_mode: str = "default",
     ) -> None:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -166,6 +196,24 @@ class DinoWMPushtAdapter:
         self._model.eval()
         print(f"[WM] ready — num_hist={self.num_hist}  frameskip={self.frameskip}  "
               f"action_dim={self._action_dim}  proprio_dim={self._proprio_dim}")
+
+        # --- optional torch.compile -------------------------------------------
+        # Call sites always go through the eager canonicalising wrappers
+        # (_encode_fn etc.); compile swaps the contiguous-only *_impl
+        # functions they call.  The only variable-length path (sync
+        # ground_and_predict's rollout) stays eager.
+        self._encode_fn = self._encode_step
+        self._predict_fn = self._predict_step
+        self._decode_fn = self._decode_step
+        self._encode_impl = self._encode_step_impl
+        self._predict_impl = self._predict_step_impl
+        self._decode_impl = self._decode_step_impl
+        self._use_compile = bool(torch_compile) and self._device.type == "cuda"
+        if torch_compile and not self._use_compile:
+            print("[WM] torch.compile requested but no CUDA device — "
+                  "ignored")
+        if self._use_compile:
+            self._setup_torch_compile(compile_mode)
 
         # --- state ------------------------------------------------------------
         # Sliding window of the most recent subsampled frames + proprio (for
@@ -481,7 +529,7 @@ class DinoWMPushtAdapter:
         # Encode the context ONCE (DINO encoder + proprio/action tiling).
         with self._lock:
             with torch.no_grad(), self._amp_ctx():
-                z = self._model.encode(obs_0, act_0_t)
+                z = self._encode_fn(obs_0, act_0_t)
 
         # Chase loop: roll one WM step at a time while the NEXT model frame
         # lands on or before the present — never past it (rolling past the
@@ -508,9 +556,7 @@ class DinoWMPushtAdapter:
                 act_t = torch.from_numpy(chunk).view(1, 1, -1).to(self._device)
                 with self._lock:
                     with torch.no_grad(), self._amp_ctx():
-                        z_pred = self._model.predict(z[:, -H:])
-                        z_new = z_pred[:, -1:]
-                        z_new = self._model.replace_actions_from_z(z_new, act_t)
+                        z_new = self._predict_fn(z[:, -H:], act_t)
                         z = torch.cat([z, z_new], dim=1)
                 all_chunks.append(np.asarray(chunk, dtype=np.float32))
                 rolled += 1
@@ -533,7 +579,7 @@ class DinoWMPushtAdapter:
                     "visual": z_obses["visual"][:, -H:],
                     "proprio": z_obses["proprio"][:, -H:],
                 }
-                decoded, _ = self._model.decode_obs(tail)
+                decoded, _ = self._decode_fn(tail)
                 vis = decoded["visual"]  # (1, H, 3, 224, 224)
                 self._ctx_visual = [vis[:, i:i + 1] for i in range(H)]
                 # Carry each published frame's own action chunk so the chain
@@ -570,6 +616,204 @@ class DinoWMPushtAdapter:
               flush=True)
 
     # -- internals -------------------------------------------------------------
+
+    def _encode_step(self, obs, act):
+        """Eager canonicalising wrapper: context encode for call sites.
+
+        torch.compile guards compare the INPUT tensors' exact strides, and
+        the real call sites feed views of larger tensors (action slices,
+        grown-chain windows) whose strides depend on the parent length —
+        if those reached the compiled graph, the first real run would
+        recompile it (the warmup pass uses canonical inputs).  This
+        wrapper stays eager; only the canonical-inputs-only ``*_impl``
+        functions are compiled.
+        """
+        obs = {"visual": _canonical_strides(obs["visual"]),
+               "proprio": _canonical_strides(obs["proprio"])}
+        return self._encode_impl(obs, _canonical_strides(act))
+
+    def _encode_step_impl(self, obs, act):
+        """Canonical-strides context encode (torch.compile target)."""
+        return self._model.encode(obs, act)
+
+    def _predict_step(self, z, act_t):
+        """Eager canonicalising wrapper: one autoregressive step.
+
+        Input z is the last ``num_hist`` frames of the chain (fixed shape,
+        but a view of the grown chain with the parent's row stride) —
+        normalised here so the compiled impl always sees canonical strides
+        and never recompiles on the first real run.
+        """
+        return self._predict_impl(
+            _canonical_strides(z[:, -self.num_hist:]),
+            _canonical_strides(act_t))
+
+    def _predict_step_impl(self, z, act_t):
+        """Canonical-strides autoregressive step (torch.compile target).
+
+        Predicts the next frame's embedding and stamps its action chunk in.
+        """
+        z_pred = self._model.predict(z)
+        z_new = z_pred[:, -1:]
+        z_new = self._model.replace_actions_from_z(z_new, act_t)
+        return z_new
+
+    def _decode_step(self, z_obs):
+        """Eager canonicalising wrapper: decode frame embeddings.
+
+        The embeddings arrive as views of the grown chain whose strides
+        depend on the chain's current length — normalised here so the
+        compiled impl's guard key matches the warmup pass.
+        """
+        z_obs = {"visual": _canonical_strides(z_obs["visual"]),
+                 "proprio": _canonical_strides(z_obs["proprio"])}
+        return self._decode_impl(z_obs)
+
+    def _decode_step_impl(self, z_obs):
+        """Canonical-strides decode (torch.compile target)."""
+        return self._model.decode_obs(z_obs)
+
+    def _setup_torch_compile(self, compile_mode: str) -> None:
+        """Compile the fixed-shape entry points and warm them up.
+
+        Compilation happens HERE (construction), never on a study tick: the
+        warmup pass runs every graph once with real shapes and A/B-tests it
+        against eager, so the first predict() call is already fast AND a
+        compiled path that isn't clearly faster is reverted.  Inductor (the
+        default backend) needs triton, which only codegens for CUDA
+        capability >= 7.0 — on older GPUs (e.g. GTX 1080) the cudagraphs
+        backend is tried instead: eager kernels captured in a CUDA graph,
+        removing per-call launch overhead without triton.  Any failure
+        degrades to eager for that entry point only — the study must never
+        crash because a checkpoint refuses to compile.
+        """
+        t0 = time.perf_counter()
+        cc = torch.cuda.get_device_capability(self._device)
+        inductor_ok = cc[0] >= 7
+        if not inductor_ok:
+            print(f"[WM] GPU capability {cc[0]}.{cc[1]} < 7.0: inductor/"
+                  f"triton unavailable — trying cudagraphs backend",
+                  flush=True)
+        self._compiled_entry_points: set = set()
+        for fn_name, step_name in (("_encode_impl", "_encode_step_impl"),
+                                   ("_predict_impl", "_predict_step_impl"),
+                                   ("_decode_impl", "_decode_step_impl")):
+            step = getattr(self, step_name)
+            fn, ok = step, False
+            if inductor_ok:
+                try:
+                    fn = torch.compile(step, mode=compile_mode)
+                    ok = True
+                except Exception as exc:
+                    print(f"[WM] torch.compile {step_name} "
+                          f"(mode={compile_mode}) failed ({exc!r}); "
+                          f"trying cudagraphs backend", flush=True)
+            if not ok:
+                try:
+                    fn = torch.compile(step, backend="cudagraphs")
+                    ok = True
+                except Exception as exc:
+                    print(f"[WM] torch.compile {step_name} (cudagraphs) "
+                          f"failed ({exc!r}); keeping eager", flush=True)
+            setattr(self, fn_name, fn)
+            if ok:
+                self._compiled_entry_points.add(fn_name)
+        if not self._compiled_entry_points:
+            print("[WM] torch.compile unavailable for this checkpoint — "
+                  "running eager", flush=True)
+            return
+        with torch.no_grad(), self._amp_ctx():
+            self._warmup_compiled()
+        kept = ", ".join(n[:-len("_impl")]
+                         for n in sorted(self._compiled_entry_points))
+        print(f"[WM] torch.compile ready in {time.perf_counter() - t0:.1f} s"
+              + (f" (kept: {kept})" if kept else " (all reverted — eager)"),
+              flush=True)
+
+    def _warmup_compiled(self) -> None:
+        """Warm every compiled graph once with real shapes (caller holds
+        no_grad + amp), then keep each entry point only if it is clearly
+        faster than its eager version.  Values are dummy — only shapes and
+        dtypes matter."""
+        H, S = self.num_hist, self.img_size
+        dev = self._device
+        obs = {
+            "visual": torch.zeros(1, H, 3, S, S, device=dev),
+            "proprio": torch.zeros(1, H, self._proprio_dim, device=dev),
+        }
+        act = torch.zeros(1, H, self._action_dim, device=dev)
+
+        # A/B the contiguous-only impls directly (same inputs the wrappers
+        # will feed them), then warm the full call-site path via the
+        # wrappers so both compile-time and runtime see identical guards.
+        self._keep_if_faster("_encode_impl", "_encode_step_impl",
+                             lambda fn: fn(obs, act))
+        z = self._encode_fn(obs, act)
+        # Canonical inputs for the A/B so the compiled specialisations match
+        # what the wrappers feed at run time (exact stride guards).
+        z_ctx = _canonical_strides(z[:, -H:])
+        act_one = _canonical_strides(act[:, :1])
+        self._keep_if_faster("_predict_impl", "_predict_step_impl",
+                             lambda fn: fn(z_ctx, act_one))
+        z = torch.cat(
+            [z, self._predict_fn(z[:, -H:], act[:, :1])], dim=1)
+        z_obs, _ = self._model.separate_emb(z)
+        # Both decode shapes, so both specialisations compile/capture now —
+        # the H-frame batch is used by the async publish.
+        one = {"visual": _canonical_strides(z_obs["visual"][:, -1:]),
+               "proprio": _canonical_strides(z_obs["proprio"][:, -1:])}
+        tail = {"visual": _canonical_strides(z_obs["visual"][:, -H:]),
+                "proprio": _canonical_strides(z_obs["proprio"][:, -H:])}
+        self._keep_if_faster("_decode_impl", "_decode_step_impl",
+                             lambda fn: (fn(one), fn(tail)))
+        self._decode_fn(one)
+        self._decode_fn(tail)
+
+    def _keep_if_faster(self, fn_name: str, step_name: str, call) -> None:
+        """First-call + A/B the compiled entry point against eager.
+
+        ``call(fn)`` runs one inference (both decode shapes in one call for
+        _decode_fn).  The compiled version is reverted to eager unless it is
+        >= 5% faster over 5 timed calls — this drops compile paths that cost
+        more than they save (e.g. cudagraphs input-copy overhead on GPUs
+        where the kernels dominate) and any entry point that fails on first
+        call.
+        """
+        if fn_name not in self._compiled_entry_points:
+            return
+        fn = getattr(self, fn_name)
+        step = getattr(self, step_name)
+        try:
+            call(fn)  # first call: compile/capture happens here, not in study
+            for _ in range(5):
+                call(fn)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(5):
+                call(fn)
+            torch.cuda.synchronize()
+            t_c = time.perf_counter() - t0
+
+            for _ in range(5):
+                call(step)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(5):
+                call(step)
+            torch.cuda.synchronize()
+            t_e = time.perf_counter() - t0
+
+            if t_c >= 0.95 * t_e:
+                print(f"[WM] torch.compile {fn_name} not faster than eager "
+                      f"({t_c / 5 * 1000:.2f} vs {t_e / 5 * 1000:.2f} "
+                      f"ms/call) — reverting to eager", flush=True)
+                self._compiled_entry_points.discard(fn_name)
+                setattr(self, fn_name, step)
+        except Exception as exc:
+            print(f"[WM] torch.compile {fn_name} failed on first call "
+                  f"({exc!r}); reverting to eager", flush=True)
+            self._compiled_entry_points.discard(fn_name)
+            setattr(self, fn_name, step)
 
     def _build_grounding_context(
         self,
@@ -677,7 +921,7 @@ class DinoWMPushtAdapter:
             "visual": z_obs["visual"][:, idx:idx + 1],
             "proprio": z_obs["proprio"][:, idx:idx + 1],
         }
-        decoded, _ = self._model.decode_obs(one)
+        decoded, _ = self._decode_fn(one)
         return decoded["visual"][0]
 
     def _advance_model(self) -> None:
@@ -719,11 +963,10 @@ class DinoWMPushtAdapter:
         # lookahead frame that model.rollout always appends — with frameskip=1
         # that wasted predictor forward runs EVERY tick.
         with torch.no_grad(), self._amp_ctx():
-            z = self._model.encode(obs_0, act_tensor[:, :self.num_hist])
-            z_pred = self._model.predict(z[:, -self.num_hist:])
-            z_new = z_pred[:, -1:]
-            z_new = self._model.replace_actions_from_z(
-                z_new, act_tensor[:, self.num_hist:self.num_hist + 1])
+            z = self._encode_fn(obs_0, act_tensor[:, :self.num_hist])
+            z_new = self._predict_fn(
+                z[:, -self.num_hist:],
+                act_tensor[:, self.num_hist:self.num_hist + 1])
             z = torch.cat([z, z_new], dim=1)
             z_obs, _ = self._model.separate_emb(z)
 

@@ -43,7 +43,7 @@ def mse(a, b):
     return float(((a - b) ** 2).mean())
 
 
-def make_env_wm(ckpt=CKPT, render_size=None):
+def make_env_wm(ckpt=CKPT, render_size=None, use_amp=False):
     """Mirror PushTInterface.run()/_collect_context() exactly.
 
     In particular, _action_history must be indexed by ABSOLUTE raw timestep
@@ -58,7 +58,7 @@ def make_env_wm(ckpt=CKPT, render_size=None):
     """
     # WM first so the env renders at the WM's training resolution (mirrors
     # the interface's auto-derivation), e.g. 448 for the high-res checkpoint.
-    wm = DinoWMPushtAdapter(ckpt_dir=ckpt)
+    wm = DinoWMPushtAdapter(ckpt_dir=ckpt, use_amp=use_amp)
     env_kw = dict(policy_checkpoint=POLICY, fixed_magnitude=False)
     if render_size is None:
         render_size = wm.img_size
@@ -82,7 +82,8 @@ def make_env_wm(ckpt=CKPT, render_size=None):
 
 def main(delay=10, ticks=150, ckpt=CKPT):
     """Sync baseline: ground_and_predict every tick (the pre-async scheme)."""
-    env, wm, hist_vis, hist_prop, actions, offset = make_env_wm(ckpt)
+    env, wm, hist_vis, hist_prop, actions, offset = \
+        make_env_wm(ckpt, use_amp=use_amp)
     fs = wm.frameskip
     mse_pred_live, mse_pred_del, mse_del_live = [], [], []
 
@@ -117,7 +118,7 @@ def main(delay=10, ticks=150, ckpt=CKPT):
 
 
 def run_async(delay, ticks, seed_action=AX, random_actions=False,
-              pace=0.03, seed=0, ckpt=CKPT):
+              pace=0.03, seed=0, ckpt=CKPT, use_amp=False):
     """Mirror the interface's async zli rules exactly.
 
     Calls the SAME ``deployment.interface.zli_tick`` helper the real
@@ -130,7 +131,8 @@ def run_async(delay, ticks, seed_action=AX, random_actions=False,
     catch an offset/indexing bug between the two, not just a from-scratch
     0-based scheme that trivially stays consistent with itself.
     """
-    env, wm, hist_vis, hist_prop, actions, offset = make_env_wm(ckpt)
+    env, wm, hist_vis, hist_prop, actions, offset = \
+        make_env_wm(ckpt, use_amp=use_amp)
     rng = np.random.default_rng(seed)
     ground_thread = None
     last_grounded = -1
@@ -222,16 +224,19 @@ def run_async(delay, ticks, seed_action=AX, random_actions=False,
         np.mean(mse_pub_live), np.mean(mse_launch_live)
 
 
-def async_main(ckpt=CKPT, delays=(10, 20, 50), ticks=150, seed_action=AX):
+def async_main(ckpt=CKPT, delays=(10, 20, 50), ticks=150, seed_action=AX,
+               use_amp=False):
     """The async scheme at several delays, plus a random-action stress pass."""
     results = {}
     for delay in delays:
         pl, dl, pubs, errs, last_ts, mpl, mll = \
-            run_async(delay, ticks, seed_action=seed_action, ckpt=ckpt)
+            run_async(delay, ticks, seed_action=seed_action, ckpt=ckpt,
+                          use_amp=use_amp)
         results[delay] = (pl, dl, pubs, errs, last_ts, mpl, mll)
     # Thread-safety smoke test: random actions, shorter pass.
     pl, dl, pubs, errs, last_ts, mpl, mll = \
-        run_async(10, 300, random_actions=True, pace=0.02, ckpt=ckpt)
+        run_async(10, 300, random_actions=True, pace=0.02, ckpt=ckpt,
+                          use_amp=use_amp)
     results["random"] = (pl, dl, pubs, errs, last_ts, mpl, mll)
 
     ok = True
@@ -266,6 +271,8 @@ if __name__ == "__main__":
     parser.add_argument("--delays", default="10,20,50",
                         help="comma-separated delays for the async suite")
     parser.add_argument("--ticks", type=int, default=150)
+    parser.add_argument("--amp", action="store_true",
+                        help="enable fp16 autocast in the adapter")
     parser.add_argument("--action", type=float, default=AX,
                         help="constant x action in pixel space (default 10)")
     args = parser.parse_args()
@@ -274,4 +281,4 @@ if __name__ == "__main__":
         main(delay=10, ckpt=args.ckpt)
     if args.mode in ("async", "all"):
         sys.exit(async_main(ckpt=args.ckpt, delays=delays, ticks=args.ticks,
-                            seed_action=args.action))
+                            seed_action=args.action, use_amp=args.amp))

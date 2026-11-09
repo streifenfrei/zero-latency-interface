@@ -86,6 +86,13 @@ class ManiSkillPushTEnv:
         goal T for task success — ManiSkill's ``intersection_thresh``.
         LOWER = more tolerant of position/orientation error.  Default 0.90
         (the stock PushT threshold).
+    workspace_bounds:
+        Optional ``(xmin, xmax, ymin, ymax)`` in metres, in WORLD table
+        coordinates: the commanded end-effector position is clamped to this
+        rectangle each step, so the stick stops at the borders (the action
+        is clipped only when a step would cross one; motion inside the
+        workspace and sliding along a border are unaffected).  ``None``
+        (default) leaves the workspace unbounded.
     seed:
         Random seed.
     """
@@ -109,6 +116,7 @@ class ManiSkillPushTEnv:
         with_velocity: bool = True,
         with_block_pose: bool = False,
         goal_tolerance: float = 0.90,
+        workspace_bounds: Optional[tuple] = None,
         seed: int = 0,
     ) -> None:
         # Resolve and register the sibling repo.
@@ -190,6 +198,11 @@ class ManiSkillPushTEnv:
         # an instance attribute at call time, so a runtime override changes
         # the goal condition without touching the task class.
         base.unwrapped.intersection_thresh = float(goal_tolerance)
+        # EE workspace bounds are enforced inside PushTXYWrapper.step(): the
+        # commanded tip position is clamped to the rectangle when a step
+        # would cross a border (validation lives there too).
+        self._workspace_bounds = tuple(float(v) for v in workspace_bounds) \
+            if workspace_bounds is not None else None
         self._wrapper = PushTXYWrapper(
             base,
             action_scale=_ascale,
@@ -207,6 +220,7 @@ class ManiSkillPushTEnv:
             level_ee_rot_bound=_level_ee_rot_bound,
             xy_absolute_target=_xy_absolute_target,
             xy_windup=_xy_windup,
+            ee_bounds=workspace_bounds,
         )
         self._venv = ManiSkillVectorEnv(
             self._wrapper,
@@ -220,10 +234,12 @@ class ManiSkillPushTEnv:
         self.state_dim: int = self._wrapper.obs_dim
 
         self._device = self._venv.device
+        _bounds = (f"  bounds={self._workspace_bounds}"
+                   if self._workspace_bounds else "")
         print(
             f"[MS-Env] PushT-XYExplore-v1 ready — control={_ctrl}  "
             f"action_scale={_ascale:.3f}  step_size={step_size:.3f}m  "
-            f"proprio_dim={self.proprio_dim}  sim={sim_backend}"
+            f"proprio_dim={self.proprio_dim}  sim={sim_backend}{_bounds}"
         )
 
     # -- PushTEnv-compatible public API ---------------------------------------

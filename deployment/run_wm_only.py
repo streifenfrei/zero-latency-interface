@@ -52,6 +52,9 @@ def main() -> None:
         "--display_size", type=int, default=840,
         help="max display dimension (default: 840)")
     parser.add_argument(
+        "--amp", action="store_true",
+        help="mixed precision (fp16 autocast) for the world model")
+    parser.add_argument(
         "--fps", type=int, default=20,
         help="target frames per second (default: 20)")
 
@@ -173,6 +176,7 @@ def main() -> None:
         mode=mode,
         wm_ckpt_dir=args.ckpt or "",
         wm_ckpt_suffix=args.ckpt_suffix,
+        wm_amp=args.amp,
         display_size=args.display_size,
         fps=args.fps,
         gamepad=gamepad,

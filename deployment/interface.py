@@ -187,6 +187,7 @@ class PushTInterface:
         mode: str = "zli",
         wm_ckpt_dir: str = "",
         wm_ckpt_suffix: str = "_latest",
+        wm_amp: bool = False,
         delay_steps: int = 10,
         display_size: int = 840,
         fps: int = 20,
@@ -208,6 +209,7 @@ class PushTInterface:
             self._wm = DinoWMPushtAdapter(
                 ckpt_dir=wm_ckpt_dir,
                 ckpt_suffix=wm_ckpt_suffix,
+                use_amp=wm_amp,
             )
 
         # --- environment (ManiSkill 3D) --------------------------------------

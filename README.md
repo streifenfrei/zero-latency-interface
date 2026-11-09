@@ -98,7 +98,7 @@ GAMEPAD=1 sbatch deployment/slurm/pusht_zli.sbatch
 ## Profiling
 
 ```bash
-python deployment/profile.py --ckpt outputs/.../checkpoints --batch_size 1 --rollout_horizon 20
+python deployment/profile_inference.py --ckpt outputs/.../checkpoints --batch_size 1 --rollout_horizon 20
 ```
 
 ## Rollout Visualisation

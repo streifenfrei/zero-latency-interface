@@ -40,7 +40,7 @@ run() { CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
 
 mkdir -p logs
 
-run deployment/profile.py \
+run deployment/profile_inference.py \
     --ckpt "$CKPT_DIR" \
     --ckpt_suffix "$CKPT_SUFFIX" \
     --batch_size "$BATCH_SIZE" \
