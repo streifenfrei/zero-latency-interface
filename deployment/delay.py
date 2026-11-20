@@ -92,3 +92,56 @@ class ConstantDelay(DelayModel):
 
     def reset(self) -> None:
         self._buffer.clear()
+
+
+class JitterDelay(DelayModel):
+    """Base delay plus an independent per-tick uniform jitter draw.
+
+    ``d_t = max(1, D + U(-J, +J))``, drawn ONCE per ``receive()`` call.
+    The study drivers call ``receive()`` exactly once per tick, so a fixed
+    seed reproduces the entire per-tick sequence (each run builds a fresh
+    instance seeded from the schedule's ``seed`` column).  Release
+    semantics mirror :class:`ConstantDelay`: the most-recent frame with
+    ``current_timestep - ts >= d_t`` wins; older released frames are
+    dropped.
+
+    Parameters
+    ----------
+    delay_steps:
+        Base delay D (the schedule's ``delay_n``).
+    jitter_steps:
+        Jitter amplitude J in frames.
+    seed:
+        RNG seed for the per-tick draws.
+    """
+
+    def __init__(self, delay_steps: int, jitter_steps: int, seed: int) -> None:
+        self._delay = int(delay_steps)
+        self._jitter = int(jitter_steps)
+        self._rng = np.random.default_rng(seed)
+        self._buffer: list[tuple[np.ndarray, np.ndarray, int]] = []
+        self.realized: list[int] = []   # one d_t per receive() call
+
+    def submit(self, frame: np.ndarray, proprio: np.ndarray,
+               timestep: int) -> None:
+        self._buffer.append((frame.copy(), proprio.copy(), timestep))
+
+    def receive(self, current_timestep: int) -> tuple[np.ndarray, np.ndarray, int] | None:
+        d_t = max(1, self._delay
+                  + int(self._rng.integers(-self._jitter, self._jitter + 1)))
+        self.realized.append(d_t)
+        result = None
+        remaining: list[tuple[np.ndarray, np.ndarray, int]] = []
+        for frame, proprio, ts in self._buffer:
+            if current_timestep - ts >= d_t:
+                result = (frame, proprio, ts)  # most-recent qualifying wins
+            else:
+                remaining.append((frame, proprio, ts))
+        if result is not None:
+            self._buffer = remaining
+        return result
+
+    def reset(self) -> None:
+        # Buffer only: the RNG (and realized history) deliberately continue —
+        # but the study builds a fresh instance per run anyway.
+        self._buffer.clear()

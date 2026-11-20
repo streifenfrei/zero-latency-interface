@@ -15,13 +15,12 @@ Dataset path is read from `$DATASET_DIR` (config resolves `${oc.env:DATASET_DIR}
 ### Online Training (ManiSkill + PPO policy)
 
 ```bash
-export ZERO_LATENCY_ROOT=/path/to/zero_latency_interface
 
 python training/train_pusht.py --online --epochs 100 --num-envs 64
 ```
 
 Requires:
-- A trained PPO policy at `$ZERO_LATENCY_ROOT/checkpoints/policy.pt`
+- A trained PPO policy at `checkpoints/policy.pt` (repo-local, bundled)
 - GPU with Vulkan driver (SAPIEN / physx_cuda backend)
 - `mani-skill` + `gymnasium` installed (`uv sync --group sim`)
 

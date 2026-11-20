@@ -31,8 +31,7 @@
 set -e
 
 # --- repo + env ---------------------------------------------------------------
-ZLI_PATH="${ZLI_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zli}"
-ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT:-/mnt/cluster/workspaces/lelismart/negative_latency/zero_latency_interface}"
+ZLI_PATH="${ZLI_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zero-latency-interface}"
 cd "$ZLI_PATH"
 
 # --- knobs --------------------------------------------------------------------
@@ -82,7 +81,6 @@ fi
 run deployment/viz_rollout.py \
     --ckpt "$CKPT_DIR" \
     --ckpt-suffix "$CKPT_SUFFIX" \
-    --zero-latency-root "$ZERO_LATENCY_ROOT" \
     --max-episodes "$MAX_EPISODES" \
     --num-rollout-steps "$NUM_ROLLOUT_STEPS" \
     --fps "$FPS" \

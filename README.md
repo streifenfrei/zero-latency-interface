@@ -45,7 +45,7 @@ export DATASET_DIR=/path/to/pusht_dataset
 python training/train_pusht.py --offline --epochs 100
 
 # Online (ManiSkill + PPO policy, requires GPU with Vulkan)
-export ZERO_LATENCY_ROOT=/path/to/zero_latency_interface
+# (policy auto-loaded from checkpoints/policy.pt — no env var needed)
 python training/train_pusht.py --online --epochs 100 --num-envs 64
 
 # SLURM

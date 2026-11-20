@@ -65,7 +65,7 @@ VQVAE_DECODER_SCALE = 16  # VWorldModel downsamples by this before DINOv2
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PCA visualisation of feature maps
-# (adapted from zero_latency_interface/model/visualize.py)
+# (adapted from the PPO rollout visualisation of the original project)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def feats_to_pca(
@@ -201,15 +201,11 @@ def viz_pusht_rollout(args) -> None:
     has_decoder = ckpt.get("decoder") is not None and args.pixel_decoder
 
     # ── set up ManiSkill env + policy ───────────────────────────────────────
-    zl_root = os.path.abspath(args.zero_latency_root)
-    if zl_root not in sys.path:
-        sys.path.insert(0, zl_root)
-
     import gymnasium as gym
     import mani_skill  # noqa: F401
-    import pusht_explore  # noqa: F401
+    import deployment.pusht_explore  # noqa: F401  registers PushT-XYExplore-v1
+    from deployment.pusht_runtime import Agent, PushTXYWrapper
     from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-    from rl_train_pusht import Agent, PushTXYWrapper
 
     policy_ckpt = torch.load(
         args.policy_checkpoint, map_location=device, weights_only=False
@@ -501,15 +497,8 @@ def main() -> None:
         "--ckpt-suffix", default="_latest", help="checkpoint suffix (default _latest)"
     )
     ap.add_argument(
-        "--zero-latency-root",
-        default=os.path.join(REPO, "..", "zero_latency_interface"),
-        help="path to zero_latency_interface repo root",
-    )
-    ap.add_argument(
         "--policy-checkpoint",
-        default=os.path.join(
-            REPO, "..", "zero_latency_interface", "checkpoints", "policy.pt"
-        ),
+        default=os.path.join(REPO, "checkpoints", "policy.pt"),
         help="path to trained PPO policy checkpoint",
     )
     ap.add_argument(

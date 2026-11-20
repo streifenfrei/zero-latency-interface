@@ -10,12 +10,12 @@ Display: [ WM-compensated view | delayed GT (what you'd normally see) ].
 
 The environment is ManiSkill PushT (3D PandaStick robot).  Requires:
   - A GPU with a working Vulkan driver (SAPIEN / physx_cuda).
-  - The sibling ``zero_latency_interface`` repo for the env wrapper.
+  - The vendored ``deployment/pusht_runtime`` for the env wrapper.
   - (optional) A trained PPO policy checkpoint so the wrapper config matches
     what the world model was trained with.
 
 Input: Keyboard WASD always works.  When a PS4/Xbox gamepad is connected, the
-left analog stick drives the agent (matching the zero_latency_interface teleop).
+left analog stick drives the agent (matching the gamepad teleop).
 
 Usage:
     # Keyboard only (basic):
@@ -31,7 +31,7 @@ Usage:
     # Match a specific training run's policy checkpoint:
     python deployment/run_zli.py \\
         --ckpt outputs/.../checkpoints --gamepad \\
-        --policy-checkpoint ../zero_latency_interface/checkpoints/policy.pt
+        --policy-checkpoint checkpoints/policy.pt
 """
 
 import argparse
@@ -99,10 +99,8 @@ def main() -> None:
     ms.add_argument("--env-id", default="PushT-XYExplore-v1",
                     help="Gymnasium env id (default: PushT-XYExplore-v1). "
                          "Use PushT-v1 for the standard task.")
-    ms.add_argument("--zero-latency-root", default=None,
-                    help="Path to zero_latency_interface repo. "
-                         "Defaults to ../zero_latency_interface relative to zli.")
-    ms.add_argument("--policy-checkpoint", default=None,
+    ms.add_argument("--policy-checkpoint", default=os.path.join(
+        REPO, "checkpoints", "policy.pt"),
                     help="Path to a trained PPO policy checkpoint (.pt). "
                          "Only its args are read to match the training-time "
                          "wrapper config (action_scale, push_height, etc.).")
@@ -166,7 +164,6 @@ def main() -> None:
     # ── build env kwargs ───────────────────────────────────────────────────
     env_kwargs = dict(
         env_id=args.env_id,
-        zero_latency_root=args.zero_latency_root,
         policy_checkpoint=args.policy_checkpoint,
         control_mode=args.control_mode,
         action_scale=args.action_scale,

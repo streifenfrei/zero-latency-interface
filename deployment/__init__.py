@@ -5,7 +5,9 @@ frame-by-frame prediction, and gamepad (PS4/Xbox) input support.
 
 The environment is ManiSkill PushT (3D PandaStick robot).  Requires:
   - A GPU with a working Vulkan driver (SAPIEN / physx_cuda).
-  - The sibling ``zero_latency_interface`` repo for ``PushTXYWrapper``.
+  - The vendored ``deployment.pusht_runtime`` (``PushTXYWrapper``) and
+    ``deployment.pusht_explore`` (env registration) — this repo is
+    standalone.
   - ManiSkill + gymnasium.
 """
 

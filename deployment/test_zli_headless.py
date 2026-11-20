@@ -34,8 +34,7 @@ from deployment.mani_skill_env import ManiSkillPushTEnv
 from deployment.wm_adapter import DinoWMPushtAdapter
 
 CKPT = os.path.join(REPO, "outputs/2026-07-06/18-46-23/checkpoints")
-POLICY = "/mnt/cluster/workspaces/lelismart/negative_latency/" \
-         "zero_latency_interface/checkpoints/policy.pt"
+POLICY = os.path.join(REPO, "checkpoints", "policy.pt")
 AX = 10.0  # pixel-space constant action (x only), 1/6 deflection
 def mse(a, b):
     a = np.asarray(a, dtype=np.float32)

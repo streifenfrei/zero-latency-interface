@@ -5,13 +5,14 @@ Provides the same ``(obs_dict, state)`` interface as the 2D pygame
 changes to the display/WM pipeline.
 
 Requires the sibling ``zero_latency_interface`` repo for
-``PushTXYWrapper`` / ``pusht_explore`` / ``rl_train_pusht``.
+``PushTXYWrapper`` from the vendored ``deployment.pusht_runtime``.
 """
 
 from __future__ import annotations
 
 import os
-import sys
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_POLICY_CHECKPOINT = os.path.join(REPO_ROOT, "checkpoints", "policy.pt")
 from typing import Optional
 
 import numpy as np
@@ -30,9 +31,6 @@ class ManiSkillPushTEnv:
     ----------
     env_id:
         Gymnasium env id.  Default ``PushT-XYExplore-v1``.
-    zero_latency_root:
-        Path to the sibling ``zero_latency_interface`` repo.  Required for
-        importing ``rl_train_pusht`` / ``pusht_explore``.
     policy_checkpoint:
         Path to a trained PPO policy ``.pt`` checkpoint.  Only its ``args``
         are read (to mirror the training-time wrapper config).  If ``None``,
@@ -101,8 +99,7 @@ class ManiSkillPushTEnv:
         self,
         *,
         env_id: str = "PushT-XYExplore-v1",
-        zero_latency_root: Optional[str] = None,
-        policy_checkpoint: Optional[str] = None,
+        policy_checkpoint: Optional[str] = DEFAULT_POLICY_CHECKPOINT,
         control_mode: str = "pd_ee_delta_pose",
         action_scale: float = 0.1,
         step_size: float = 0.02,
@@ -119,20 +116,11 @@ class ManiSkillPushTEnv:
         workspace_bounds: Optional[tuple] = None,
         seed: int = 0,
     ) -> None:
-        # Resolve and register the sibling repo.
-        if zero_latency_root is None:
-            zero_latency_root = os.path.join(
-                os.path.dirname(__file__), "..", "..", "zero_latency_interface"
-            )
-        zl_root = os.path.abspath(zero_latency_root)
-        if zl_root not in sys.path:
-            sys.path.insert(0, zl_root)
-
         import gymnasium as gym
         import mani_skill  # noqa: F401
-        import pusht_explore  # noqa: F401
+        import deployment.pusht_explore  # noqa: F401  registers PushT-XYExplore-v1
+        from deployment.pusht_runtime import PushTXYWrapper
         from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-        from rl_train_pusht import PushTXYWrapper
 
         # --- load training-time config if available --------------------------
         targs: dict = {}

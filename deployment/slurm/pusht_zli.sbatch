@@ -12,7 +12,6 @@
 #   MODE                — "zli" (default), "wm_only", or "passthrough"
 #   CKPT_DIR            — path to checkpoints/ directory
 #   DELAY_STEPS         — simulated delay in raw timesteps (ZLI mode, default: 10)
-#   ZERO_LATENCY_ROOT   — path to zero_latency_interface repo
 #   POLICY_CHECKPOINT   — path to PPO policy checkpoint (args only)
 #   CONTROL_MODE        — "pd_ee_delta_pose" (default) or "pd_ee_pose"
 #   STEP_SIZE           — metres/step at full deflection (default: 0.02)
@@ -28,7 +27,7 @@
 
 set -e
 
-ZLI_PATH="${ZLI_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zli}"
+ZLI_PATH="${ZLI_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zero-latency-interface}"
 cd "$ZLI_PATH"
 export PATH="/mnt/cluster/environments/lelismart/uv:$PATH"
 
@@ -40,8 +39,7 @@ DISPLAY_SIZE="${DISPLAY_SIZE:-840}"
 FPS="${FPS:-20}"
 
 # ManiSkill environment config.
-ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT:-$ZLI_PATH/../zero_latency_interface}"
-POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-$ZERO_LATENCY_ROOT/checkpoints/policy.pt}"
+POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-$ZLI_PATH/checkpoints/policy.pt}"
 CONTROL_MODE="${CONTROL_MODE:-pd_ee_delta_pose}"
 STEP_SIZE="${STEP_SIZE:-0.02}"
 ACTION_SCALE="${ACTION_SCALE:-0.1}"
@@ -50,7 +48,7 @@ SIM_BACKEND="${SIM_BACKEND:-physx_cuda}"
 echo "host=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 echo "mode=$MODE  ckpt=$CKPT_DIR$CKPT_SUFFIX  delay=$DELAY_STEPS steps"
 echo "mani: control=$CONTROL_MODE  step=$STEP_SIZE  sim=$SIM_BACKEND"
-echo "zl_root=$ZERO_LATENCY_ROOT  policy_ckpt=$POLICY_CHECKPOINT"
+echo "policy_ckpt=$POLICY_CHECKPOINT"
 
 # Strip distributed env vars.
 run() { CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
@@ -68,7 +66,6 @@ fi
 
 # Shared ManiSkill args.
 MANI_ARGS=(
-    --zero-latency-root "$ZERO_LATENCY_ROOT"
     --control-mode "$CONTROL_MODE"
     --step-size "$STEP_SIZE"
     --action-scale "$ACTION_SCALE"
@@ -92,7 +89,6 @@ import sys
 sys.path.insert(0, '.')
 from deployment import get_interface
 env_kw = dict(
-    zero_latency_root='$ZERO_LATENCY_ROOT',
     control_mode='$CONTROL_MODE',
     step_size=$STEP_SIZE,
     action_scale=$ACTION_SCALE,

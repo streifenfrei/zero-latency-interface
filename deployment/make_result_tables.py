@@ -51,19 +51,36 @@ def _log(msg: str) -> None:
     print(f"[TABLES] {msg}", file=sys.stderr, flush=True)
 
 
-def load_rows(path: Path, all_attempts: bool, phase: str = "main") -> list[dict]:
-    """Rows of one phase (mirror of plot_study_results.load_rows)."""
+def load_rows(path: Path, attempts: str = "last",
+              phase: str = "main") -> list[dict]:
+    """Rows of one phase, one row per (participant, session_trial) slot.
+
+    ``attempts`` resolves retried trial slots: "last" keeps the final
+    logged attempt (post-save retries supersede earlier attempts; in-run
+    fault-discards never log a row, so a lone attempt-2 row is kept as
+    the slot's only outcome), "first" keeps the earliest, "all" keeps
+    every attempt.  Mirror of plot_study_results.load_rows otherwise.
+    """
     rows = []
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
             if r.get("phase", "main") != phase:
                 continue
-            if not all_attempts and int(r.get("attempt", 1)) != 1:
-                continue
             rows.append(r)
     if not rows:
         raise SystemExit(f"[TABLES] no usable rows in {path}")
-    return rows
+    if attempts == "all":
+        return rows
+    best: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["participant_id"], int(r["session_trial"]))
+        a = int(r.get("attempt", 1))
+        cur = best.get(key)
+        if cur is None or (a > int(cur.get("attempt", 1))
+                           if attempts == "last" else
+                           a < int(cur.get("attempt", 1))):
+            best[key] = r
+    return list(best.values())
 
 
 def _float(v) -> float | None:
@@ -211,11 +228,22 @@ def _wald(est, cov, R):
 
 # ── Table 1: timing budget ────────────────────────────────────────────────────
 
-def gain_frames(delay: int, tau_ms: float, tau_f_ms: float) -> float | None:
-    """G(D) = D·τ/(τf − τ)."""
-    if tau_f_ms <= tau_ms:
+def gain_frames(delay: int, tau_e_ms: float, tau_p_ms: float,
+                tau_f_ms: float) -> float | None:
+    """G(k) = (τe + k·τp)/(τf − τp) — the corrected horizon bound
+    (main paper, Appendix C): encoder cost plus k predictor passes,
+    amortised against the per-frame budget after one predictor pass."""
+    denom = tau_f_ms - tau_p_ms
+    if denom <= 0:
         return None
-    return delay * tau_ms / (tau_f_ms - tau_ms)
+    return (tau_e_ms + delay * tau_p_ms) / denom
+
+
+def horizon_bound(delay: int, g: float | None) -> float | None:
+    """k + 2⌈G⌉ − 1 — the Appendix C bound on the required horizon."""
+    if g is None:
+        return None
+    return delay + 2 * math.ceil(g) - 1
 
 
 def table1_tex(args) -> str:
@@ -224,7 +252,8 @@ def table1_tex(args) -> str:
     head1 = " & $\\tau$ (ms)" + "".join(
         f" & \\multicolumn{{2}}{{c}}{{$k{{=}}{d}$ ({d * 1000 / args.tick_hz:.0f} ms)}}"
         for d in delays)
-    head2 = " & " + "".join(" & $G$ & $k{+}G$" for _ in delays)
+    head2 = " & " + "".join(
+        " & $G$ & $k{+}2\\lceil G\\rceil{-}1$" for _ in delays)
     lines = [
         "\\begin{tabular}{%s}" % spec,
         "\\hline",
@@ -236,16 +265,16 @@ def table1_tex(args) -> str:
     comp_rows = [
         ("Predictor $\\tau_p$", args.pred_ms, True),
         ("Decoder $\\tau_q$", args.dec_ms, False),
-        ("Encoder", args.enc_ms, False),
+        ("Encoder $\\tau_e$", args.enc_ms, False),
         ("Tick budget $\\tau_f$", args.tick_ms, False),
     ]
     for label, tau, is_pred in comp_rows:
         cells = [label, _fmt_ms(tau)]
         if is_pred:
             for d in delays:
-                g = gain_frames(d, args.pred_ms, args.tick_ms)
+                g = gain_frames(d, args.enc_ms, args.pred_ms, args.tick_ms)
                 cells.append(_fmt_g(g))
-                cells.append(_fmt_g(d + g))
+                cells.append(_fmt_g(horizon_bound(d, g)))
         else:
             cells += ["\\multicolumn{2}{c}{---}"] * len(delays)
         lines.append(" & ".join(cells) + " \\\\")
@@ -253,10 +282,11 @@ def table1_tex(args) -> str:
     lines.append("\\end{tabular}")
 
     caption = (args.caption_1 +
-               " Component latencies (batch 1, RTX 2080 Ti, frameskip 1 — "
-               "one model step per frame) against the per-frame tick budget "
-               "$\\tau_f$; $G(k)=k\\tau_p/(\\tau_f-\\tau_p)$ look-ahead steps "
-               "and $k{+}G$ total predictor passes for a delay of $k$ frames "
+               " Component latencies from the main paper's Appendix C "
+               "($\\tau_e$, $\\tau_p$, $\\tau_q$), against the per-frame tick "
+               "budget $\\tau_f$; $G(k)=(\\tau_e+k\\tau_p)/(\\tau_f-\\tau_p)$ "
+               "(the corrected horizon gain) and the resulting horizon bound "
+               "$k+2\\lceil G\\rceil-1$ for a delay of $k$ frames "
                "(1 frame = 50 ms).")
     return _float_block(caption, args.label_1, "\n".join(lines))
 
@@ -393,11 +423,12 @@ def table2_descriptive_tex(rows, args, practice_rows=None) -> str:
 
 
 def cox_completion(rows, delays, tick_hz: float):
-    """Stratified Cox PH on simulated seconds (ticks / tick rate).
+    """Delay-stratified Cox PH with participant-clustered robust SEs.
 
-    Hazard ratios are invariant to time scaling, so the fit equals one on
-    raw ticks — the /tick_hz conversion keeps the units consistent with
-    the descriptive completion table.
+    Matches the main paper's specification: delay as stratum (the delay
+    main effects are absorbed, so only condition and condition×delay are
+    estimable) with the covariance clustered on participant.  Times are
+    simulated seconds (ticks / tick rate; HRs are scale-invariant).
     """
     from statsmodels.duration.hazard_regression import PHReg
     recs = [(str(r["participant_id"]), int(r["delay_n"]), r["setting"],
@@ -409,33 +440,29 @@ def cox_completion(rows, delays, tick_hz: float):
     endog = np.array([t for _, _, _, t, _ in recs], dtype=float)
     status = np.array([s for _, _, _, _, s in recs], dtype=float)
     wm = np.array([1.0 if s == "wm" else 0.0 for _, _, s, _, _ in recs])
-    cols_main = [wm]
+    # Delay dummies are collinear with the delay strata — the main-effects
+    # fit is condition only; the full fit adds the condition×delay terms.
+    X_main = np.column_stack([wm])
+    cols_full = [wm]
     for d in delays[1:]:
-        cols_main.append(np.array([1.0 if dd == d else 0.0
-                                   for _, dd, _, _, _ in recs]))
-    cols_full = cols_main + [
-        wm * np.array([1.0 if dd == d else 0.0
-                       for _, dd, _, _, _ in recs])
-        for d in delays[1:]]
-    # NO intercept: aliased under strata.  HR rows come from the
-    # MAIN-effects fit; the interaction Wald from the full fit.
-    X_main = np.column_stack(cols_main)
+        cols_full.append(wm * np.array([1.0 if dd == d else 0.0
+                                        for _, dd, _, _, _ in recs]))
     X_full = np.column_stack(cols_full)
-    strata = np.asarray([pid for pid, _, _, _, _ in recs])
+    strata = np.asarray([int(d) for _, d, _, _, _ in recs])
+    cluster = np.asarray([pid for pid, _, _, _, _ in recs])
     out = {"n": len(recs)}
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             res_main = PHReg(endog, X_main, status=status, strata=strata,
-                             ties="breslow").fit()
+                             ties="breslow").fit(groups=cluster)
             res_full = PHReg(endog, X_full, status=status, strata=strata,
-                             ties="breslow").fit()
+                             ties="breslow").fit(groups=cluster)
         for w in caught:
             _log(f"Cox: {w.message}")
-        k_int = len(cols_main)
         R = np.zeros((len(delays[1:]), X_full.shape[1]))
         for j in range(len(delays[1:])):
-            R[j, k_int + j] = 1.0
+            R[j, 1 + j] = 1.0
         stat, df, p_int = _wald(res_full.params, res_full.cov_params(), R)
         out.update({"hr": np.exp(res_main.params),
                     "ci": np.exp(res_main.conf_int()),
@@ -464,15 +491,10 @@ def table4_tex(rows, args) -> str:
     else:
         rows_out = [("Condition (wm)",
                      f"HR = {_fmt_est(cox['hr'][0])}",
-                     _fmt_ci(*cox["ci"][0]), _fmt_p(cox["p"][0]))]
-        for j, d in enumerate(delays[1:]):
-            rows_out.append((f"Delay {d} vs {delays[0]}",
-                             f"HR = {_fmt_est(cox['hr'][1 + j])}",
-                             _fmt_ci(*cox["ci"][1 + j]),
-                             _fmt_p(cox["p"][1 + j])))
-        rows_out.append(("Cond $\\times$ Delay",
-                         _fmt_chi(cox["int_stat"], cox["int_df"]),
-                         "---", _fmt_p(cox["int_p"])))
+                     _fmt_ci(*cox["ci"][0]), _fmt_p(cox["p"][0])),
+                    ("Cond $\\times$ Delay",
+                     _fmt_chi(cox["int_stat"], cox["int_df"]),
+                     "---", _fmt_p(cox["int_p"]))]
         for e, est, ci, p in rows_out:
             lines.append(" & ".join([e, est, ci, p]) + " \\\\")
     lines.append("\\hline")
@@ -480,14 +502,13 @@ def table4_tex(rows, args) -> str:
     caption = (args.caption_4 +
                " Cox proportional-hazards model of time-to-completion in "
                "simulated seconds (ticks / "
-               f"{args.tick_hz:g}\\,Hz) with condition (no-WM vs WM), "
-               "delay, and their interaction as covariates; timed-out runs "
-               "enter as right-censored observations at the timeout limit. "
-               "Participants are included as strata, so each condition "
-               "contrast is a within-participant comparison. Hazard ratios "
-               "(HR) greater than 1 indicate faster completion; the "
-               "interaction row is a joint Wald test whether the WM "
-               "advantage varies across delays.")
+               f"{args.tick_hz:g}\\,Hz), the main paper's specification: "
+               "delay as stratum with participant-clustered robust standard "
+               "errors (delay main effects are absorbed by the strata, so "
+               "only the condition HR and its interaction with delay are "
+               "estimable). Timed-out runs enter as right-censored "
+               "observations; HR greater than 1 indicates faster "
+               "completion.")
     return _float_block(caption, args.label_4, "\n".join(lines))
 
 
@@ -496,7 +517,14 @@ def table2_tex(rows, args, practice_rows=None) -> str:
     caption = (args.caption_2 +
                " Completion time is simulated (ticks / 20 Hz) over "
                "successful trials. Bold marks the better (lower) value "
-               "of the two conditions per column.")
+               "of the two conditions per column. Each trial slot "
+               "contributes its final logged attempt (post-save retries "
+               "supersede earlier attempts; in-run fault-discards never "
+               "log).")
+    if _row_jitters(rows):
+        caption += (" Pooled across both jitter amplitudes (±2 and ±10 "
+                    "frames) — this pilot contains no constant-delay "
+                    "condition.")
     if practice_rows:
         caption += (" Delay 0 are the undelayed GT practice "
                     "(familiarization) runs, shown for reference only.")
@@ -504,6 +532,182 @@ def table2_tex(rows, args, practice_rows=None) -> str:
 
 
 # ── Table 3: rating statistics ────────────────────────────────────────────────
+
+def _row_jitters(rows) -> list:
+    """Sorted nominal jitter amplitudes present in the data ([] if none)."""
+    from deployment.study_schema import jitter_level
+    return sorted({j for r in rows
+                   if (j := jitter_level(r)) is not None})
+
+
+def jitter_descriptives(rows, tick_hz: float, delays, jitters) -> dict:
+    """Per (delay, setting, jitter): run counts, timeout %, mean/median
+    simulated seconds (success-only participant cell means), and the
+    realized delay mean/std (ms)."""
+    from deployment.study_schema import jitter_level
+    n_runs, n_timeout = Counter(), Counter()
+    pp: dict[tuple, list[float]] = defaultdict(list)
+    real: dict[tuple, list[tuple]] = defaultdict(list)
+    for r in rows:
+        j = jitter_level(r)
+        if j is None:
+            continue
+        cell = (int(r["delay_n"]), r["setting"], j)
+        n_runs[cell] += 1
+        if str(r.get("timed_out", "")).strip().lower() == "true":
+            n_timeout[cell] += 1
+        dm, ds = _float(r.get("delay_mean_ms")), _float(r.get("delay_std_ms"))
+        if dm is not None and ds is not None:
+            real[cell].append((dm, ds))
+        if str(r.get("success", "")).strip().lower() == "true":
+            v = _float(r.get("completion_ticks"))
+            if v is not None:
+                pp[(r["participant_id"],) + cell].append(v / tick_hz)
+    cells = {k: float(np.mean(v)) for k, v in pp.items()}
+    by_cell: dict[tuple, list[float]] = defaultdict(list)
+    for (pid, d, s, j), v in cells.items():
+        by_cell[(d, s, j)].append(v)
+    out = {}
+    for d in delays:
+        for s in ("no_wm", "wm"):
+            for j in jitters:
+                vals = np.asarray(by_cell.get((d, s, j), []), dtype=float)
+                rv = np.asarray(real.get((d, s, j), []), dtype=float)
+                out[(d, s, j)] = {
+                    "n_runs": n_runs.get((d, s, j), 0),
+                    "n_part": int(vals.size),
+                    "timeout_pct": 100.0 * n_timeout.get((d, s, j), 0)
+                    / max(n_runs.get((d, s, j), 1), 1),
+                    "mean_s": float(vals.mean()) if vals.size else math.nan,
+                    "median_s": float(np.median(vals))
+                    if vals.size else math.nan,
+                    "delay_mean_ms": float(rv[:, 0].mean())
+                    if rv.size else math.nan,
+                    "delay_std_ms": float(rv[:, 1].mean())
+                    if rv.size else math.nan,
+                }
+    return out
+
+
+def jitter_lmm(rows, tick_hz, delays, jitters):
+    """MixedLM on log simulated seconds: condition + jitter + delay
+    dummies + condition×jitter, per-participant cell means."""
+    from deployment.study_schema import jitter_level
+    jhi = max(jitters)
+    pp: dict[tuple, list[float]] = defaultdict(list)
+    for r in rows:
+        j = jitter_level(r)
+        if j is None:
+            continue
+        if str(r.get("success", "")).strip().lower() != "true":
+            continue
+        v = _float(r.get("completion_ticks"))
+        if v is None:
+            continue
+        pp[(r["participant_id"], int(r["delay_n"]), r["setting"],
+            j)].append(v / tick_hz)
+    recs = sorted((k, np.mean(v)) for k, v in pp.items())
+    if not recs:
+        return None, "no successful jitter rows"
+    endog = np.log(np.array([v for _, v in recs], dtype=float))
+    wm = np.array([1.0 if s == "wm" else 0.0
+                   for (_, d, s, j), _ in recs])
+    jh = np.array([1.0 if j == jhi else 0.0
+                   for (_, d, s, j), _ in recs])
+    cols = [np.ones_like(wm), wm, jh]
+    for d in delays[1:]:
+        cols.append(np.array([1.0 if dd == d else 0.0
+                              for (_, dd, _, _), _ in recs]))
+    cols.append(wm * jh)  # condition×jitter interaction
+    X = np.column_stack(cols)
+    groups = [pid for (pid, _, _, _), _ in recs]
+    res, flags, error = _fit_mixed(endog, X, X[:, :2], groups, reml=True)
+    for fl in flags:
+        _log(f"jitter LMM: {fl}")
+    if res is None:
+        return None, error
+    b, se, p, ci = _fe_stats(res, X.shape[1])
+    R = np.zeros((1, X.shape[1]))
+    R[0, -1] = 1.0
+    stat, df, p_int = _wald(res.fe_params[:X.shape[1]],
+                            res.cov_params()[:X.shape[1], :X.shape[1]], R)
+    return {"n": len(recs), "b": b, "se": se, "p": p, "ci": ci,
+            "int_stat": stat, "int_df": df, "int_p": p_int,
+            "flags": flags}, None
+
+
+def table5_tex(rows, args) -> str:
+    """Jitter ablation: completion + realized delay stats per cell, and
+    the jitter-effect tests."""
+    delays = [int(d) for d in args.delays]
+    jitters = _row_jitters(rows)
+    desc = jitter_descriptives(rows, args.tick_hz, delays, jitters)
+    lines = [
+        "\\begin{tabular}{l l r r r r r r r}",
+        "\\hline",
+        "Delay & Condition & Jitter & $n$ & Mean & Median & Timeout (\\%) "
+        "& Real. mean & Real. std \\\\",
+        " & & (fr.) & & (s) & (s) & & (ms) & (ms) \\\\",
+        "\\hline",
+    ]
+    for d in delays:
+        for si, s in enumerate(("no_wm", "wm")):
+            for ji, j in enumerate(jitters):
+                c = desc[(d, s, j)]
+                cells = [
+                    str(d) if si == 0 and ji == 0 else "",
+                    _cell_label(d, s) if ji == 0 else "",
+                    f"$\\pm${j}",
+                    str(c["n_runs"]),
+                    _fmt_sec(c["mean_s"]) if math.isfinite(c["mean_s"])
+                    else "---",
+                    _fmt_sec(c["median_s"]) if math.isfinite(c["median_s"])
+                    else "---",
+                    f"{c['timeout_pct']:.1f}",
+                    _fmt_sec(c["delay_mean_ms"]) if math.isfinite(
+                        c["delay_mean_ms"]) else "---",
+                    _fmt_sec(c["delay_std_ms"]) if math.isfinite(
+                        c["delay_std_ms"]) else "---",
+                ]
+                lines.append(" & ".join(cells) + " \\\\")
+    lines.append("\\hline")
+    lines.append("\\end{tabular}")
+
+    if not args.no_stats:
+        jm, jerr = jitter_lmm(rows, args.tick_hz, delays, jitters)
+        lines += ["", "\\vspace{0.6em}", "",
+                  "\\begin{tabular}{l l r r r}",
+                  "\\hline",
+                  "Test & Effect & Estimate & 95\\% CI & $p$ \\\\",
+                  "\\hline"]
+        if jm is None:
+            lines.append(f"\\multicolumn{{5}}{{l}}{{Jitter model failed: "
+                         f"{jerr}}} \\\\")
+        else:
+            jhi = max(jitters)
+            rows_out = [
+                ("Jitter LMM", f"Jitter ${jhi}$ vs ${min(jitters)}$",
+                 _fmt_est(jm["b"][2]), _fmt_ci(*jm["ci"][2]),
+                 _fmt_p(jm["p"][2])),
+                ("Jitter LMM", "Cond $\\times$ Jitter",
+                 _fmt_chi(jm["int_stat"], jm["int_df"]),
+                 "---", _fmt_p(jm["int_p"])),
+            ]
+            for t, e, est, ci, p in rows_out:
+                lines.append(" & ".join([t, e, est, ci, p]) + " \\\\")
+        lines.append("\\hline")
+        lines.append("\\end{tabular}")
+
+    caption = (args.caption_5 +
+               " Jitter ablation: per delay, condition and jitter amplitude "
+               "(frames), completion time in simulated seconds over "
+               "successful trials and the realized per-run delay mean/std. "
+               "The model row tests the log-time jitter effect with "
+               "condition and delay controlled. Each trial slot contributes "
+               "its final logged attempt (post-save retries supersede "
+               "earlier attempts; in-run fault-discards never log).")
+    return _float_block(caption, args.label_5, "\n".join(lines))
+
 
 TLX_ITEMS = [
     ("Mental demand", "tlx_mental"),
@@ -696,16 +900,19 @@ def main() -> None:
     ap.add_argument("--output", default=None,
                     help="write the LaTeX fragment to this file instead of "
                          "stdout")
-    ap.add_argument("--tables", nargs="+", default=["1", "2", "3", "4"],
-                    help="which tables to emit (default: 1 2 3 4; "
-                         "4 = Cox tests)")
-    ap.add_argument("--pred-ms", type=float, default=6.45,
-                    help="predictor latency τp in ms (fs=1/224 on RTX 2080 "
-                         "Ti; default 6.45)")
-    ap.add_argument("--dec-ms", type=float, default=13.43,
-                    help="decoder latency τq in ms (default 13.43)")
-    ap.add_argument("--enc-ms", type=float, default=5.25,
-                    help="encoder latency in ms (default 5.25)")
+    ap.add_argument("--tables", nargs="+", default=["1", "2", "3", "4", "5"],
+                    help="which tables to emit (default: 1 2 3 4 5; "
+                         "4 = Cox tests, 5 = jitter ablation — auto-skipped "
+                         "when the data has no jitter)")
+    ap.add_argument("--pred-ms", type=float, default=6.0,
+                    help="predictor latency τp in ms (Appendix C default "
+                         "6.0)")
+    ap.add_argument("--dec-ms", type=float, default=13.0,
+                    help="decoder latency τq in ms (Appendix C default "
+                         "13.0)")
+    ap.add_argument("--enc-ms", type=float, default=11.0,
+                    help="encoder latency τe in ms (Appendix C default "
+                         "11.0)")
     ap.add_argument("--tick-ms", type=float, default=50.0,
                     help="per-frame tick budget τf in ms (default 50)")
     ap.add_argument("--delays", nargs="+", type=int, default=[10, 15, 20],
@@ -720,12 +927,20 @@ def main() -> None:
                     help="Table 3 caption (LaTeX, prepended)")
     ap.add_argument("--caption-4", default="Inferential tests. ",
                     help="Table 4 caption (LaTeX, prepended)")
+    ap.add_argument("--caption-5", default="Jitter ablation. ",
+                    help="Table 5 caption (LaTeX, prepended)")
     ap.add_argument("--label-1", default="tab:timing")
     ap.add_argument("--label-2", default="tab:completion")
     ap.add_argument("--label-3", default="tab:tlx")
     ap.add_argument("--label-4", default="tab:tests")
-    ap.add_argument("--all-attempts", action="store_true",
-                    help="include retry attempts in the statistics")
+    ap.add_argument("--label-5", default="tab:jitter")
+    ap.add_argument("--attempts", choices=["first", "last", "all"],
+                    default="last",
+                    help="retry rule per (participant, trial) slot: 'last' "
+                         "(default) keeps the final logged attempt — "
+                         "post-save retries supersede earlier attempts, and "
+                         "in-run fault-discards never log; 'first' keeps the "
+                         "earliest; 'all' keeps every attempt")
     ap.add_argument("--include-practice", action="store_true",
                     help="add the undelayed GT practice runs as a delay-0 "
                          "reference row in the completion table "
@@ -736,13 +951,13 @@ def main() -> None:
     args = ap.parse_args()
     args.delays = [int(d) for d in args.delays]
 
-    rows = load_rows(Path(args.results), args.all_attempts)
-    tlx_rows = load_rows(Path(args.results), all_attempts=True)
-    practice_rows = load_rows(Path(args.results), args.all_attempts,
+    rows = load_rows(Path(args.results), args.attempts)
+    tlx_rows = load_rows(Path(args.results), attempts="all")
+    practice_rows = load_rows(Path(args.results), args.attempts,
                               phase="practice") if args.include_practice \
         else None
     _log(f"{len(rows)} main rows "
-         f"(attempts={'all' if args.all_attempts else 'first'}), "
+         f"(attempts={args.attempts}), "
          f"{len(tlx_cells(tlx_rows))} TLX cells"
          + (f", {len(practice_rows)} practice rows included"
             if practice_rows else ""))
@@ -755,14 +970,26 @@ def main() -> None:
             elif t == "2":
                 parts.append(table2_tex(rows, args, practice_rows))
             elif t == "3":
+                # NOTE: the TLX items were not properly administered in the
+                # pilot — for the rebuttal report run with --tables "1 2 4 5".
                 parts.append(table3_tex(tlx_rows, args))
             elif t == "4":
                 if args.no_stats:
                     _log("table 4 (Cox tests) skipped — --no-stats")
                     continue
                 parts.append(table4_tex(rows, args))
+            elif t == "5":
+                if not _row_jitters(rows):
+                    _log("table 5 (jitter ablation) skipped — no jitter "
+                         "data in this CSV")
+                    continue
+                if args.no_stats:
+                    _log("table 5 (jitter ablation) — stats block skipped "
+                         "by --no-stats")
+                parts.append(table5_tex(rows, args))
             else:
-                _log(f"unknown table id {t!r} (expected 1/2/3/4) — skipped")
+                _log(f"unknown table id {t!r} (expected 1/2/3/4/5) — "
+                     f"skipped")
         except Exception as exc:
             _log(f"table {t} failed: {type(exc).__name__}: {exc}")
     tex = "\n\n".join(parts) + "\n"

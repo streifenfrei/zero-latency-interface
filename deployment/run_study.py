@@ -35,7 +35,7 @@ prompt without saving; Ctrl+C quits the process.
 
 Usage:
     python deployment/run_study.py --ckpt outputs/.../checkpoints \\
-        --policy-checkpoint ../zero_latency_interface/checkpoints/policy.pt \\
+        --policy-checkpoint checkpoints/policy.pt \\
         --gamepad --schedule deployment/schedule.csv
 """
 
@@ -65,7 +65,7 @@ import numpy as np
 # invisible window.
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 
-from deployment.delay import ConstantDelay
+from deployment.delay import ConstantDelay, DelayModel
 from deployment.gamepad import GamepadInput
 from deployment.interface import FONT, _resize_to_fit, zli_tick
 from deployment.mani_skill_env import ManiSkillPushTEnv
@@ -833,10 +833,15 @@ def _run_gt(env, gamepad, W: int, H: int, timeout_minutes: float, fps: int,
 
 def _run_delayed(env, gamepad, W: int, H: int, delay_steps: int,
                  timeout_minutes: float, fps: int,
-                 metrics: RunMetrics, run_label: str = "") -> Optional[dict]:
-    """no_wm setting: delayed GT view, single attempt."""
+                 metrics: RunMetrics, run_label: str = "",
+                 delay: Optional[DelayModel] = None) -> Optional[dict]:
+    """no_wm setting: delayed GT view, single attempt.
+
+    ``delay`` overrides the delay model (e.g. a seeded JitterDelay from the
+    jitter study); ``None`` = the constant-delay default.
+    """
     obs, _ = env.reset()
-    delay = ConstantDelay(delay_steps)
+    delay = delay or ConstantDelay(delay_steps)
     delayed_frame = obs["visual"]
     timestep = 0
     timeout = timeout_minutes * 60.0
@@ -887,11 +892,14 @@ def _run_delayed(env, gamepad, W: int, H: int, delay_steps: int,
 
 def _run_wm(env, wm: DinoWMPushtAdapter, gamepad, W: int, H: int,
             delay_steps: int, timeout_minutes: float, fps: int,
-            metrics: RunMetrics, run_label: str = "") -> Optional[dict]:
+            metrics: RunMetrics, run_label: str = "",
+            delay: Optional[DelayModel] = None) -> Optional[dict]:
     """wm setting: WM-compensated view (shared zli_tick path).
 
-    Returns a result dict or None (aborted).  The grounding worker is
-    joined on every exit path — the WM is a session-long shared object.
+    ``delay`` overrides the delay model (e.g. a seeded JitterDelay from the
+    jitter study); ``None`` = the constant-delay default.  Returns a result
+    dict or None (aborted).  The grounding worker is joined on every exit
+    path — the WM is a session-long shared object.
     """
     obs, _ = env.reset()
     fs, needed = wm.frameskip, wm.num_hist
@@ -931,7 +939,7 @@ def _run_wm(env, wm: DinoWMPushtAdapter, gamepad, W: int, H: int,
         wm.predict(np.zeros(2, dtype=np.float32))
     wm.reset(gt_frames[-needed:], gt_proprios[-needed:])
     display_frame = gt_frames[-1]
-    delay = ConstantDelay(delay_steps)
+    delay = delay or ConstantDelay(delay_steps)
     grounding_thread = None
     last_grounded_ts = -1
     get_timestep: Callable[[], int] = lambda: timestep
@@ -1024,8 +1032,13 @@ def _run_wm(env, wm: DinoWMPushtAdapter, gamepad, W: int, H: int,
 
 def run_row(env, wm, gamepad, W: int, H: int, row: dict,
             timeout_minutes: float, fps: int,
-            run_label: str = "") -> tuple[Optional[dict], dict]:
-    """Execute one schedule row.  Returns (result_or_None, metrics_dict)."""
+            run_label: str = "",
+            delay: Optional[DelayModel] = None) -> tuple[Optional[dict], dict]:
+    """Execute one schedule row.  Returns (result_or_None, metrics_dict).
+
+    ``delay`` overrides the delay model for the delayed/WM conditions
+    (e.g. a seeded JitterDelay from the jitter study); practice ignores it.
+    """
     collect_pairs = (row["setting"] == "wm")
     metrics = RunMetrics(fps=fps, collect_pairs=collect_pairs)
     metrics.start()
@@ -1035,10 +1048,12 @@ def run_row(env, wm, gamepad, W: int, H: int, row: dict,
                          run_label)
     elif row["setting"] == "wm":
         result = _run_wm(env, wm, gamepad, W, H, row["delay_n"],
-                         timeout_minutes, fps, metrics, run_label)
+                         timeout_minutes, fps, metrics, run_label,
+                         delay=delay)
     else:  # no_wm
         result = _run_delayed(env, gamepad, W, H, row["delay_n"],
-                              timeout_minutes, fps, metrics, run_label)
+                              timeout_minutes, fps, metrics, run_label,
+                              delay=delay)
     metrics_dict = metrics.finalize(discard=(result is None))
     # Any dynamo compilation during the run itself would have stalled a tick
     # inside the measured window (inflating completion_time_s / tick-rate
@@ -1050,7 +1065,9 @@ def run_row(env, wm, gamepad, W: int, H: int, row: dict,
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+        extra: Optional[Callable[[argparse.ArgumentParser], None]] = None
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Schedule-driven user-study UI for PushT teleoperation")
     parser.add_argument("--ckpt", required=True,
@@ -1101,8 +1118,8 @@ def parse_args() -> argparse.Namespace:
 
     ms = parser.add_argument_group("ManiSkill environment")
     ms.add_argument("--env-id", default="PushT-XYExplore-v1")
-    ms.add_argument("--zero-latency-root", default=None)
-    ms.add_argument("--policy-checkpoint", default=None)
+    ms.add_argument("--policy-checkpoint", default=os.path.join(
+        REPO, "checkpoints", "policy.pt"))
     ms.add_argument("--control-mode", default="pd_ee_delta_pose",
                     choices=["pd_ee_delta_pose", "pd_ee_pose"])
     ms.add_argument("--action-scale", type=float, default=0.1)
@@ -1128,6 +1145,8 @@ def parse_args() -> argparse.Namespace:
                          "position is clamped to this rectangle — actions "
                          "are clipped only when a step would cross a border "
                          "(default: unbounded).")
+    if extra is not None:
+        extra(parser)  # hook for e.g. the jitter study's --jitter flag
     return parser.parse_args()
 
 
@@ -1165,7 +1184,6 @@ def main() -> None:
                             compile_mode=args.compile_mode)
     env_kwargs = dict(
         env_id=args.env_id,
-        zero_latency_root=args.zero_latency_root,
         policy_checkpoint=args.policy_checkpoint,
         control_mode=args.control_mode,
         action_scale=args.action_scale,

@@ -43,7 +43,6 @@
 # ---------------------------------------------------------------------------
 
 ZLI_PATH="${ZLI_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zero-latency-interface}"
-ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT:-/mnt/cluster/workspaces/lelismart/negative_latency/zero_latency_interface}"
 CKPT_BASE_PATH="${CKPT_BASE_PATH:-${ZLI_PATH}/outputs}"
 
 IMG_SIZE="${IMG_SIZE:-448}"
@@ -82,7 +81,6 @@ VENV_PATH="${VENV_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zli/.
 
 source ~/.wandb_key           # W&B API key for logging
 
-export ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT}"
 
 echo "============================================"
 echo "DINO-WM — PushT online training (HIGH-RES)"
@@ -93,7 +91,7 @@ echo "         frameskip=${FRAMESKIP} num_hist=${NUM_HIST}"
 echo "         epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
 echo "         num_envs=${NUM_ENVS} samples_per_epoch=${SAMPLES_PER_EPOCH}"
 echo "         with_block_pose=${WITH_BLOCK_POSE}"
-echo "policy:  ${ZERO_LATENCY_ROOT}/checkpoints/policy.pt"
+echo "policy:  ${ZLI_PATH}/checkpoints/policy.pt"
 echo "ckpts:   ${CKPT_BASE_PATH}"
 echo "============================================"
 

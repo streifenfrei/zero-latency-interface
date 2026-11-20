@@ -20,13 +20,12 @@
 # offline dataset needed.
 #
 # Prerequisites:
-#   1. Trained PPO policy at $ZERO_LATENCY_ROOT/checkpoints/policy.pt
+#   1. Trained PPO policy at $ZLI_PATH/checkpoints/policy.pt
 #   2. GPU with Vulkan driver (SAPIEN/physx_cuda backend)
 #   3. uv environment with mani-skill + gymnasium (uv sync --extra sim)
 #
 # Overridable via env:
-#   ZERO_LATENCY_ROOT — path to zero_latency_interface repo (required)
-#   CKPT_BASE_PATH    — where to save model checkpoints
+#   #   CKPT_BASE_PATH    — where to save model checkpoints
 #   EPOCHS            — training epochs (default: 100)
 #   BATCH_SIZE        — global batch size (default: 32)
 #   FRAMESKIP         — env steps per stored frame (default: 5)
@@ -41,7 +40,6 @@
 # ---------------------------------------------------------------------------
 
 ZLI_PATH="${ZLI_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zero-latency-interface}"
-ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT:-/mnt/cluster/workspaces/lelismart/negative_latency/zero_latency_interface}"
 CKPT_BASE_PATH="${CKPT_BASE_PATH:-${ZLI_PATH}/outputs}"
 
 EPOCHS="${EPOCHS:-50}"
@@ -89,7 +87,6 @@ VENV_PATH="${VENV_PATH:-/mnt/cluster/workspaces/lelismart/negative_latency/zli/.
 
 source ~/.wandb_key           # W&B API key for logging
 
-export ZERO_LATENCY_ROOT="${ZERO_LATENCY_ROOT}"
 
 echo "============================================"
 echo "DINO-WM — PushT online training"
@@ -98,7 +95,7 @@ echo "config:  env=pusht_online frameskip=${FRAMESKIP} num_hist=${NUM_HIST}"
 echo "         epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
 echo "         num_envs=${NUM_ENVS} samples_per_epoch=${SAMPLES_PER_EPOCH}"
 echo "         with_block_pose=${WITH_BLOCK_POSE}"
-echo "policy:  ${ZERO_LATENCY_ROOT}/checkpoints/policy.pt"
+echo "policy:  ${ZLI_PATH}/checkpoints/policy.pt"
 echo "ckpts:   ${CKPT_BASE_PATH}"
 echo "============================================"
 

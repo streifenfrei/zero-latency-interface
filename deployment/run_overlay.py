@@ -19,7 +19,7 @@ drives the agent (same mapping as run_wm_only.py / run_zli.py).
 Usage:
     python deployment/run_overlay.py --ckpt outputs/.../checkpoints
     python deployment/run_overlay.py --ckpt outputs/.../checkpoints --gamepad \\
-        --policy-checkpoint ../zero_latency_interface/checkpoints/policy.pt
+        --policy-checkpoint checkpoints/policy.pt
 """
 
 import argparse
@@ -86,9 +86,8 @@ def main() -> None:
     ms = parser.add_argument_group("ManiSkill environment")
     ms.add_argument("--env-id", default="PushT-XYExplore-v1",
                     help="Gymnasium env id (default: PushT-XYExplore-v1).")
-    ms.add_argument("--zero-latency-root", default=None,
-                    help="Path to zero_latency_interface repo.")
-    ms.add_argument("--policy-checkpoint", default=None,
+    ms.add_argument("--policy-checkpoint", default=os.path.join(
+        REPO, "checkpoints", "policy.pt"),
                     help="Path to a trained PPO policy checkpoint (.pt); "
                          "only its args are read for the wrapper config.")
     ms.add_argument("--control-mode", default="pd_ee_delta_pose",
@@ -139,7 +138,6 @@ def main() -> None:
 
     env_kwargs = dict(
         env_id=args.env_id,
-        zero_latency_root=args.zero_latency_root,
         policy_checkpoint=args.policy_checkpoint,
         control_mode=args.control_mode,
         action_scale=args.action_scale,

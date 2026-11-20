@@ -57,15 +57,11 @@ def _build_env_policy(args, device):
     auto_reset=False and ignore_terminations=True so exactly ``--ticks``
     ticks run on one uninterrupted trajectory.
     """
-    zl_root = os.path.abspath(args.zero_latency_root)
-    if zl_root not in sys.path:
-        sys.path.insert(0, zl_root)
-
     import gymnasium as gym
     import mani_skill  # noqa: F401
-    import pusht_explore  # noqa: F401
+    import deployment.pusht_explore  # noqa: F401  registers PushT-XYExplore-v1
+    from deployment.pusht_runtime import Agent, PushTXYWrapper
     from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-    from rl_train_pusht import Agent, PushTXYWrapper
 
     policy_ckpt = torch.load(args.policy_checkpoint, map_location=device,
                              weights_only=False)
@@ -355,9 +351,7 @@ def main() -> None:
              "frameskip-1 checkpoint)")
     ap.add_argument("--ckpt-suffix", default="_latest")
     ap.add_argument("--policy-checkpoint", default=os.path.join(
-        REPO, "..", "zero_latency_interface", "checkpoints", "policy.pt"))
-    ap.add_argument("--zero-latency-root", default=os.path.join(
-        REPO, "..", "zero_latency_interface"))
+        REPO, "checkpoints", "policy.pt"))
     ap.add_argument("--delays", nargs="+", type=int, default=[10, 15, 20],
                     help="delays in raw ticks (ms = ticks * 1000 / tick-hz)")
     ap.add_argument("--roll-lengths", nargs="+", type=int,

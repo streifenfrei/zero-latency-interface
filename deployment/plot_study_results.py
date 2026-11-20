@@ -116,6 +116,8 @@ METRIC_LABELS = {
     "lpips_mean": "LPIPS",
     "completion_ticks": "Completion time (ticks)",
     "completion_time_sim_s": "Completion time (s)",
+    "delay_mean_ms": "Realized delay (ms)",
+    "delay_std_ms": "Realized jitter std (ms)",
     "tlx_mental": "TLX: mental demand (0–100)",
     "tlx_performance": "TLX: performance (0–100)",
     "tlx_frustration": "TLX: frustration (0–100)",
@@ -336,9 +338,7 @@ def _ensure_statsmodels():
             _SM_WARNED = True
             print("[POWER] statsmodels not installed — skipping required-n "
                   "analysis.")
-            print("[POWER]        install:  source "
-                  "/mnt/cluster/environments/lelismart/uv/env && "
-                  "uv add statsmodels")
+            print("[POWER]        install:  pip install statsmodels")
         else:
             _SM_MODULE = _sm
     return _SM_MODULE
@@ -711,6 +711,113 @@ def plot_metric(rows: list[dict], metric: str, out_path: Path,
     print(f"[PLOT] wrote {out_path}")
 
 
+def plot_metric_jitter(rows: list[dict], metric: str, out_path: Path) -> None:
+    """Jitter-aware variant of plot_metric: four lines, setting × jitter.
+
+    Color codes the setting (baseline/compensated); linestyle codes the
+    jitter amplitude (solid = ±2 frames, dashed = ±10).  The nominal
+    amplitude comes from the jitter_n column or is derived from the
+    realized delay_std_ms (see study_schema.jitter_level).
+    """
+    from deployment.study_schema import jitter_level
+
+    success_only = metric in SUCCESS_ONLY_METRICS
+    sel = [r for r in rows] if not success_only else [
+        r for r in rows
+        if str(r.get("success", "")).strip().lower() == "true"]
+    if not sel:
+        print(f"[PLOT] skip {metric}_jitter: no rows")
+        return
+    stats = cell_stats_jitter(sel, metric)
+    if not stats:
+        print(f"[PLOT] skip {metric}_jitter: no jitter data")
+        return
+    delays = sorted({d for (d, _s, _j) in stats})
+    jitters = sorted({j for (_d, _s, j) in stats})
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.2), dpi=150)
+    ax.set_facecolor("#ffffff")
+    fig.patch.set_facecolor("#ffffff")
+
+    for setting in SETTINGS:
+        for j in jitters:
+            xs, means, sems = [], [], []
+            for d in delays:
+                cell = stats.get((d, setting, j))
+                if cell is None:
+                    continue
+                mean, sem, _n = cell
+                xs.append(d * MS_PER_TICK)
+                means.append(mean)
+                sems.append(sem)
+            if not xs:
+                continue
+            ax.errorbar(
+                xs, means, yerr=sems,
+                label=f"{SETTING_LABELS[setting]} ±{j}",
+                color=COLORS[setting],
+                linestyle="-" if j == min(jitters) else "--",
+                linewidth=2, marker="o", markersize=5, capsize=3,
+                elinewidth=1.2, zorder=3,
+            )
+
+    ax.set_xlabel("Delay (ms)")
+    ax.set_ylabel(METRIC_LABELS[metric])
+    if metric in ("success_rate", "timeout_rate"):
+        ax.set_ylim(-0.02, 1.05)
+    xticks = [d * MS_PER_TICK for d in delays]
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([f"{t:g}" for t in xticks])
+    _style_ax(ax)
+    ax.legend(frameon=False, fontsize=9, loc="best")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, facecolor="#ffffff")
+    plt.close(fig)
+    print(f"[PLOT] wrote {out_path}")
+
+
+def cell_stats_jitter(rows: list[dict], metric: str):
+    """Two-stage reduction over (delay, setting, jitter) cells.
+
+    Returns ``{(delay, setting, jitter): (mean, sem, n_participants)}``.
+    """
+    from deployment.study_schema import jitter_level
+
+    per_participant: dict[tuple, list[float]] = defaultdict(list)
+    for r in rows:
+        if metric == "success_rate":
+            v = 1.0 if str(r.get("success", "")).strip().lower() == "true" \
+                else 0.0
+        else:
+            v = _float(r.get(metric))
+            if v is None:
+                continue
+        j = jitter_level(r)
+        if j is None:
+            continue
+        per_participant[
+            (r["participant_id"], int(r["delay_n"]), r["setting"], j)
+        ].append(v)
+
+    participant_cells: dict[tuple, float] = {}
+    for (pid, d, s, j), vals in per_participant.items():
+        participant_cells[(pid, d, s, j)] = float(np.mean(vals))
+
+    by_cell: dict[tuple, list[float]] = defaultdict(list)
+    for (pid, d, s, j), v in participant_cells.items():
+        by_cell[(d, s, j)].append(v)
+    out = {}
+    for (d, s, j), vals in by_cell.items():
+        vals = np.asarray(vals, dtype=np.float64)
+        mean = float(vals.mean())
+        sem = float(vals.std(ddof=1) / np.sqrt(len(vals))) \
+            if len(vals) > 1 else 0.0
+        out[(d, s, j)] = (mean, sem, len(vals))
+    return out
+
+
 def plot_practice_curve(practice_rows: list[dict], out_path: Path) -> None:
     """Practice learning curve: trial index vs simulated completion time.
 
@@ -786,6 +893,9 @@ def main() -> None:
                     help="include retry attempts (default: attempt 1 only)")
     ap.add_argument("--no-power", action="store_true",
                     help="skip the required-sample-size (LMM) analysis")
+    ap.add_argument("--jitter", action="store_true",
+                    help="additionally render jitter-aware panels "
+                         "(setting × jitter lines) for the key metrics")
     args = ap.parse_args()
 
     if args.metrics:
@@ -810,6 +920,15 @@ def main() -> None:
                 and metric not in POWER_SKIP_METRICS):
             print_power_analysis(rows, metric)
     plot_practice_curve(practice_rows, out_dir / "practice_curve.png")
+    if args.jitter:
+        from deployment.study_schema import jitter_level
+        if any(jitter_level(r) is not None for r in rows):
+            for metric in ("completion_ticks", "ssim_mean", "lpips_mean",
+                           "delay_std_ms", "delay_mean_ms"):
+                plot_metric_jitter(rows, metric,
+                                   out_dir / f"{metric}_jitter.png")
+        else:
+            print("[PLOT] --jitter given but no jitter data found")
     print(f"[PLOT] done → {out_dir}")
 
 

@@ -128,8 +128,19 @@ def tlx_positions(pattern):
 def build_schedule(delays, trials, participants, cycle_length=None,
                    practice=0, spares=0, settings=("no_wm", "wm"),
                    practice_delay=None, first_pid=1, seed_base=1000,
-                   tlx=True):
-    """Return (rows, cycle_length, n_orders, tlx_clean)."""
+                   tlx=True, jitters=None):
+    """Return (rows, cycle_length, n_orders, tlx_clean).
+
+    With ``jitters`` (a 2-sequence, e.g. [2, 10]) the within-block trials
+    gain a second factor: each setting's ``trials`` occurrences alternate
+    the two jitter levels in an ABBA pattern (lo hi hi lo), so the block
+    length is UNCHANGED and every (setting, jitter) cell gets
+    ``trials // 2`` trials with balanced serial positions.  The jitter
+    start flips with the block, mirroring the setting start.
+    """
+    if jitters is not None and trials % 2:
+        raise ValueError("--jitters requires an even --trials")
+
     orders = williams_square(len(delays))
     n_orders = len(orders)
     natural_cycle = n_orders * 2          # x2 for which setting starts a block
@@ -153,13 +164,16 @@ def build_schedule(delays, trials, participants, cycle_length=None,
         # ---- practice: undelayed, no world model, not analysed -------------
         for t in range(practice):
             trial_no += 1
-            rows.append(dict(
+            row = dict(
                 participant_id=pid, schedule_row=r, phase="practice",
                 block_index=0, delay_n=practice_delay,
                 setting="none", trial_in_block=t + 1,
                 session_trial=trial_no, is_spare=0, do_tlx=False,
                 seed=seed_base + 10000 * p + trial_no,
-            ))
+            )
+            if jitters is not None:
+                row["jitter_n"] = 0
+            rows.append(row)
 
         # ---- measured blocks -----------------------------------------------
         for b, d_idx in enumerate(delay_order):
@@ -167,6 +181,17 @@ def build_schedule(delays, trials, participants, cycle_length=None,
             # with block position within a participant
             block_start = (start_setting + b) % 2
             pattern = abba_pattern(trials, block_start)
+
+            # second factor: jitter levels alternate within each setting's
+            # occurrences (lo hi hi lo), flipping with the block
+            if jitters is not None:
+                per = trials // 2
+                jseq_by = {s: abba_pattern(per, block_start) for s in (0, 1)}
+                occ = {0: 0, 1: 0}
+                jseq = []
+                for s in pattern:
+                    jseq.append(jitters[jseq_by[s][occ[s]]])
+                    occ[s] += 1
 
             if tlx:
                 tpos, clean = tlx_positions(pattern)
@@ -177,14 +202,17 @@ def build_schedule(delays, trials, participants, cycle_length=None,
 
             for t, s in enumerate(pattern):
                 trial_no += 1
-                rows.append(dict(
+                row = dict(
                     participant_id=pid, schedule_row=r, phase="main",
                     block_index=b + 1, delay_n=delays[d_idx],
                     setting=settings[s], trial_in_block=t + 1,
                     session_trial=trial_no, is_spare=0,
                     do_tlx=(t + 1) in rated,
                     seed=seed_base + 10000 * p + trial_no,
-                ))
+                )
+                if jitters is not None:
+                    row["jitter_n"] = jseq[t]
+                rows.append(row)
 
         # ---- spares: a condition-agnostic pool of pre-committed seeds ------
         # The delay/setting of a replacement is forced by whichever trial was
@@ -195,13 +223,16 @@ def build_schedule(delays, trials, participants, cycle_length=None,
         # the questionnaire after its replacement instead.
         for k in range(spares):
             trial_no += 1
-            rows.append(dict(
+            row = dict(
                 participant_id=pid, schedule_row=r, phase="spare",
                 block_index="", delay_n="", setting="",
                 trial_in_block=k + 1,
                 session_trial=trial_no, is_spare=1, do_tlx=False,
                 seed=seed_base + 10000 * p + trial_no,
-            ))
+            )
+            if jitters is not None:
+                row["jitter_n"] = ""
+            rows.append(row)
 
     return rows, cycle_length, n_orders, tlx_clean
 
@@ -210,7 +241,8 @@ def build_schedule(delays, trials, participants, cycle_length=None,
 # Balance verification
 # --------------------------------------------------------------------------- #
 
-def verify(rows, delays, settings, cycle_length, n_orders, participants):
+def verify(rows, delays, settings, cycle_length, n_orders, participants,
+           jitters=None):
     main = [r for r in rows if r["phase"] == "main"]
     out = []
     ok = True
@@ -259,6 +291,48 @@ def verify(rows, delays, settings, cycle_length, n_orders, participants):
     for s in settings:
         out.append(f"  {s:>7} : {sum(msp[s]) / len(msp[s]):.3f}")
     out.append("")
+
+    # ---- jitter dimension (only when jitters were requested) -------------- #
+    if jitters:
+        jp = defaultdict(Counter)
+        for r in main:
+            jp[r["jitter_n"]][r["trial_in_block"]] += 1
+        out.append("jitter x within-block position (want equal rows):")
+        out.append("  jitter  | " + " ".join(f"t{t:>3}" for t in tpos))
+        for j in jitters:
+            out.append(f"  {j:>7} | "
+                       + " ".join(f"{jp[j][t]:>4}" for t in tpos))
+        jm = defaultdict(list)
+        for r in main:
+            jm[r["jitter_n"]].append(r["trial_in_block"])
+        out.append("mean within-block position per jitter (want identical):")
+        for j in jitters:
+            out.append(f"  {j:>7} : {sum(jm[j]) / len(jm[j]):.3f}")
+        # The two rated trials per block fall at different jitter levels
+        # (position balance and homogeneous runs are mutually exclusive for
+        # the second setting) — acceptable as long as the DIRECTION of the
+        # confound is counterbalanced: half the participants rate
+        # A@lo vs B@hi, the other half A@hi vs B@lo.
+        direct = Counter()
+        by_pb = defaultdict(dict)
+        for r in main:
+            if r["do_tlx"]:
+                by_pb[(r["participant_id"], r["block_index"])][
+                    r["setting"]] = r["jitter_n"]
+        for v in by_pb.values():
+            a_j, b_j = v[settings[0]], v[settings[1]]
+            if a_j != b_j:
+                direct[(a_j, b_j)] += 1
+        out.append("rated-pair jitter directions (want equal counts):")
+        for (a_j, b_j), c in sorted(direct.items()):
+            out.append(f"  {settings[0]}@{a_j} vs {settings[1]}@{b_j} : {c}")
+        dc = sorted(direct.values())
+        if dc and dc[0] != dc[-1]:
+            out.append("  (UNBALANCED rated-pair jitter direction)")
+            ok = False
+        else:
+            out.append("  (counterbalanced across participants)")
+        out.append("")
 
     # ---- TLX placement --------------------------------------------------- #
     rated = [r for r in main if r["do_tlx"]]
@@ -341,9 +415,15 @@ def verify(rows, delays, settings, cycle_length, n_orders, participants):
     out.append("")
 
     # per-cell trial counts
-    cell = Counter((r["delay_n"], r["setting"]) for r in main)
+    if jitters:
+        def cell_key(r):
+            return (r["delay_n"], r["setting"], r["jitter_n"])
+    else:
+        def cell_key(r):
+            return (r["delay_n"], r["setting"])
+    cell = Counter(cell_key(r) for r in main)
     counts = sorted(cell.values())
-    out.append(f"trials per (delay, setting) cell: "
+    out.append(f"trials per {'(delay, setting, jitter)' if jitters else '(delay, setting)'} cell: "
                f"min {counts[0]}, max {counts[-1]}"
                + ("  (equal)" if counts[0] == counts[-1] else "  (UNEQUAL)"))
     if counts[0] != counts[-1]:
@@ -378,6 +458,11 @@ def main(argv=None):
                     help="delay used during practice (default: lowest delay)")
     ap.add_argument("--settings", nargs=2, default=["no_wm", "wm"],
                     metavar=("A", "B"), help="the two setting labels")
+    ap.add_argument("--jitters", nargs=2, type=int, default=None,
+                    metavar=("LO", "HI"),
+                    help="add a jitter factor (two amplitudes in frames, "
+                         "e.g. '2 10'); each setting's trials split ABBA "
+                         "between them — block length unchanged")
     ap.add_argument("--no-tlx", action="store_true",
                     help="do not mark any trial for the TLX questionnaire")
     ap.add_argument("--first-pid", type=int, default=1,
@@ -395,15 +480,21 @@ def main(argv=None):
     if a.trials < 1:
         ap.error("--trials must be >= 1")
 
+    if a.jitters is not None and len(set(a.jitters)) != 2:
+        ap.error("--jitters values must be distinct")
+
     rows, cycle_length, n_orders, tlx_clean = build_schedule(
         delays=a.delays, trials=a.trials, participants=a.participants,
         cycle_length=a.cycle_length, practice=a.practice, spares=a.spares,
         settings=tuple(a.settings), practice_delay=a.practice_delay,
-        first_pid=a.first_pid, seed_base=a.seed_base, tlx=not a.no_tlx)
+        first_pid=a.first_pid, seed_base=a.seed_base, tlx=not a.no_tlx,
+        jitters=a.jitters)
 
     fields = ["participant_id", "schedule_row", "phase", "block_index",
               "delay_n", "setting", "trial_in_block", "session_trial",
               "is_spare", "do_tlx", "seed"]
+    if a.jitters is not None:
+        fields.append("jitter_n")
     with open(a.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -411,7 +502,8 @@ def main(argv=None):
 
     if not a.quiet:
         report, ok = verify(rows, a.delays, tuple(a.settings),
-                            cycle_length, n_orders, a.participants)
+                            cycle_length, n_orders, a.participants,
+                            jitters=a.jitters)
         print(report, file=sys.stderr)
         print(file=sys.stderr)
         if a.cycle_length is not None and a.cycle_length != n_orders * 2:

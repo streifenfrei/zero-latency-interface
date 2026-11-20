@@ -11,14 +11,14 @@ continuously rolls out trajectory windows and pushes chunks to a thread-safe
 queue; the main training thread pulls from the queue via an IterableDataset
 that the Trainer's DataLoader wraps.
 
-Design mirrors ``zero_latency_interface/model/data.py`` (PushTNoiseLadderProvider)
+Design mirrors the original project's noise-ladder provider
 but adapted for the dino_wm data format: each yielded sample is a (T, ...) chunk
 (not a pre-assembled batch), actions are concatenated across ``frameskip``
 sub-steps matching ``TrajSlicerDataset``, and images are normalized to [-1, 1].
 
 The policy checkpoint, env wrapper (PushTXYWrapper), Agent class, and
 exploring-starts env registration are imported at runtime from the sibling
-``zero_latency_interface`` repository via ``sys.path`` insertion — no code
+the sibling repository via ``sys.path`` insertion — no code
 duplication.
 """
 
@@ -55,14 +55,12 @@ class PushTOnlineProvider:
     last env is pure noise, and the intermediate envs span the spectrum.
 
     The policy and env are reconstructed from the checkpoint's saved ``args``
-    using the ``PushTXYWrapper`` / ``Agent`` from the sibling
-    ``zero_latency_interface`` repository.
+    using the vendored ``deployment.pusht_runtime`` (PushTXYWrapper / Agent).
     """
 
     def __init__(
         self,
-        policy_checkpoint: str,
-        zero_latency_root: str,
+        policy_checkpoint: str | None = None,
         num_envs: int = 64,
         chunk_length: int = 4,
         frameskip: int = 5,
@@ -85,8 +83,11 @@ class PushTOnlineProvider:
                 f"noise_kind must be 'random', 'idle' or 'mixed', got {noise_kind!r}"
             )
 
+        if policy_checkpoint is None:
+            policy_checkpoint = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "checkpoints", "policy.pt")
         self.policy_checkpoint = policy_checkpoint
-        self.zero_latency_root = zero_latency_root
         self.num_envs = num_envs
         self.chunk_length = chunk_length
         self.frameskip = frameskip
@@ -144,19 +145,13 @@ class PushTOnlineProvider:
         if self._venv is not None:
             return
 
-        # Ensure the zero_latency_interface repo root is importable so we can
-        # import its top-level scripts (rl_train_pusht, pusht_explore).
-        zl_root = os.path.abspath(self.zero_latency_root)
-        if zl_root not in sys.path:
-            sys.path.insert(0, zl_root)
-
         # Lazy heavy imports: keep the dino_wm package importable without
         # ManiSkill when the offline pusht config is used.
         import gymnasium as gym
         import mani_skill  # noqa: F401  registers PushT-v1
-        import pusht_explore  # noqa: F401  registers PushT-XYExplore-v1
+        import deployment.pusht_explore  # noqa: F401  registers PushT-XYExplore-v1
+        from deployment.pusht_runtime import Agent, PushTXYWrapper
         from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-        from rl_train_pusht import Agent, PushTXYWrapper
 
         ckpt = torch.load(
             self.policy_checkpoint, map_location=self.device, weights_only=False
@@ -588,7 +583,7 @@ def load_pusht_online_train_val(
         samples_per_epoch: How many individual samples the iterable dataset
             yields before raising StopIteration (one "epoch").
         **kwargs:  All remaining kwargs from the env config, forwarded to
-            ``PushTOnlineProvider`` (policy_checkpoint, zero_latency_root,
+            ``PushTOnlineProvider`` (policy_checkpoint,
             num_envs, img_size, val_ratio, noise_kind, noise_p_min/max, ...).
 
     Returns:
@@ -599,6 +594,7 @@ def load_pusht_online_train_val(
 
     # Strip Hydra config keys that aren't provider constructor params.
     kwargs.pop("data_path", None)
+    kwargs.pop("zero_latency_root", None)  # legacy sibling-repo key
 
     provider = PushTOnlineProvider(
         chunk_length=chunk_length,

@@ -15,7 +15,7 @@ deployment.*) are importable, and delegates to dino_wm's Hydra-based Trainer.
 
 Requirements:
     - Offline: DATASET_DIR env var pointing to PushT dataset
-    - Online:  ZERO_LATENCY_ROOT env var + trained PPO policy checkpoint
+    - Online:  trained PPO policy checkpoint (repo checkpoints/policy.pt)
 """
 
 import argparse
@@ -60,9 +60,6 @@ def main() -> None:
                         help="Parallel envs / noise-ladder rungs (online only, default: 64)")
     parser.add_argument("--samples-per-epoch", type=int, default=50000,
                         help="Samples per epoch (online only, default: 50000)")
-    parser.add_argument("--zero-latency-root", type=str, default=None,
-                        help="Path to zero_latency_interface repo (online only; "
-                             "defaults to $ZERO_LATENCY_ROOT or ../zero_latency_interface)")
 
     # Paths.
     parser.add_argument("--ckpt-base-path", type=str,
@@ -86,14 +83,6 @@ def main() -> None:
     # Determine environment config.
     if args.online:
         env_name = "pusht_online"
-        # Resolve zero_latency_root.
-        zl_root = args.zero_latency_root or os.environ.get("ZERO_LATENCY_ROOT")
-        if zl_root is None:
-            zl_root = os.path.join(REPO, "..", "zero_latency_interface")
-        zl_root = os.path.abspath(zl_root)
-        os.environ["ZERO_LATENCY_ROOT"] = zl_root
-        if not os.path.isdir(zl_root):
-            print(f"WARNING: zero_latency_interface not found at {zl_root}")
     else:
         env_name = "pusht"
         # DATASET_DIR is required for offline.
@@ -129,6 +118,10 @@ def main() -> None:
     cmd = [
         sys.executable, train_script,
         "--config-name", "train.yaml",
+        # The online env config lives in THIS repo (tracked), not in the
+        # dino_wm submodule — hydra resolves `env=pusht_online` through the
+        # search path without touching the external submodule.
+        f"hydra.searchpath=[{os.path.join(REPO, 'training', 'configs')}]",
     ] + overrides
 
     if args.dry_run:
